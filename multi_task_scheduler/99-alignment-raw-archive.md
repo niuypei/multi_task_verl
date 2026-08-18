@@ -1,7 +1,8 @@
-# Bubble Coordinator — 背景与约束对齐
+# 历史归档：Bubble Coordinator 背景与约束讨论
 
-> 本文档是单一事实来源。所有对齐讨论的结论都追加于此，不覆盖、不删除已确认项。
-> 配套记忆：`memory/rl-inference-bubble-coordinator.md`、`memory/verl-architecture-non-negotiable.md`
+> 本文保存早期讨论原文，其中包含已经被后续决策推翻的 STANDALONE、命名和边界结论，不再是
+> 当前事实来源，也不进行术语追溯改写。当前约束以
+> [`00-project-alignment.md`](./00-project-alignment.md) 为准。
 
 状态图例：`[ ]` 待对齐 · `[~]` 有初步倾向，待确认 · `[x]` 已确认
 
