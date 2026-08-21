@@ -1,0 +1,320 @@
+<title>方案正确性与可行性分析</title>
+<style>
+  :root{
+    --ground:#F4F3EF;
+    --surface:#FBFAF7;
+    --surface-2:#FFFFFF;
+    --ink:#1E2024;
+    --muted:#595B63;
+    --faint:#7C7E86;
+    --rule:#E0DFD9;
+    --rule-strong:#C9C8C1;
+    --accent:#2F5566;
+    --accent-soft:#E3ECEF;
+    --ok:#2E7D52;
+    --ok-soft:#E4EFE8;
+    --warn:#9A6A1C;
+    --warn-soft:#F3EAD6;
+    --err:#A8362F;
+    --err-soft:#F2E1DF;
+    --block:#5B4A8A;
+    --block-soft:#EAE5F2;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --serif:Georgia,"Iowan Old Style","Palatino Linotype",Palatino,"Times New Roman",serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#15171B; --surface:#1C1F25; --surface-2:#202329;
+      --ink:#E7E6E1; --muted:#A2A4AC; --faint:#7A7C84;
+      --rule:#2A2D33; --rule-strong:#3A3D44;
+      --accent:#8FB4C6; --accent-soft:#1F2D33;
+      --ok:#7FCB9C; --ok-soft:#1E2A22;
+      --warn:#D6A85C; --warn-soft:#2A2418;
+      --err:#E07A72; --err-soft:#2C1E1C;
+      --block:#B8A8E0; --block-soft:#241F2E;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#15171B; --surface:#1C1F25; --surface-2:#202329;
+    --ink:#E7E6E1; --muted:#A2A4AC; --faint:#7A7C84;
+    --rule:#2A2D33; --rule-strong:#3A3D44;
+    --accent:#8FB4C6; --accent-soft:#1F2D33;
+    --ok:#7FCB9C; --ok-soft:#1E2A22;
+    --warn:#D6A85C; --warn-soft:#2A2418;
+    --err:#E07A72; --err-soft:#2C1E1C;
+    --block:#B8A8E0; --block-soft:#241F2E;
+  }
+  *{box-sizing:border-box;}
+  html{background:var(--ground);}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.62;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:780px;margin:0 auto;padding:56px 28px 96px;}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:0.14em;text-transform:uppercase;color:var(--accent);margin-bottom:14px;}
+  h1{font-family:var(--serif);font-size:34px;line-height:1.18;font-weight:600;margin:0 0 14px;letter-spacing:-0.01em;text-wrap:balance;}
+  .lede{font-size:16.5px;color:var(--muted);margin:0 0 6px;max-width:64ch;}
+  .meta{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:18px;padding-top:14px;border-top:1px solid var(--rule);display:flex;flex-wrap:wrap;gap:8px 18px;}
+  .meta span b{color:var(--ink);font-weight:600;}
+  h2{font-family:var(--serif);font-size:21px;font-weight:600;margin:52px 0 4px;letter-spacing:-0.005em;text-wrap:balance;}
+  h2 .n{font-family:var(--mono);font-size:13px;color:var(--accent);margin-right:10px;font-weight:500;letter-spacing:0.04em;}
+  h3{font-family:var(--sans);font-size:14.5px;font-weight:600;margin:26px 0 8px;color:var(--ink);letter-spacing:0.005em;}
+  p{margin:0 0 13px;}
+  p code,li code,.inline-code{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);border:1px solid var(--rule);padding:1px 5px;border-radius:4px;color:var(--ink);word-break:break-all;}
+  .lead{color:var(--muted);}
+  strong{color:var(--ink);font-weight:600;}
+  /* verdict banner */
+  .verdict{display:flex;align-items:flex-start;gap:12px;margin:18px 0;padding:14px 16px;border-radius:6px;border:1px solid var(--rule);background:var(--surface);font-size:14px;}
+  .verdict .chip{flex-shrink:0;margin-top:2px;}
+  .verdict .vt{color:var(--muted);line-height:1.55;}
+  .verdict .vt b{color:var(--ink);}
+  /* chips */
+  .chip{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:0.03em;padding:2px 8px;border-radius:3px;white-space:nowrap;display:inline-block;}
+  .chip.ok{background:var(--ok-soft);color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 30%,transparent);}
+  .chip.warn{background:var(--warn-soft);color:var(--warn);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);}
+  .chip.err{background:var(--err-soft);color:var(--err);border:1px solid color-mix(in srgb,var(--err) 30%,transparent);}
+  .chip.block{background:var(--block-soft);color:var(--block);border:1px solid color-mix(in srgb,var(--block) 30%,transparent);}
+  .chip.neutral{background:var(--surface-2);color:var(--muted);border:1px solid var(--rule);}
+  /* finding list */
+  .finds{list-style:none;margin:14px 0 8px;padding:0;}
+  .finds li{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid var(--rule);}
+  .finds li:last-child{border-bottom:none;}
+  .finds .stripe{flex:0 0 3px;align-self:stretch;border-radius:2px;background:var(--rule-strong);min-height:100%;}
+  .finds li.ok .stripe{background:var(--ok);}
+  .finds li.warn .stripe{background:var(--warn);}
+  .finds li.err .stripe{background:var(--err);}
+  .finds li.block .stripe{background:var(--block);}
+  .finds .body{flex:1;min-width:0;}
+  .finds .head{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:3px;}
+  .finds .loc{font-family:var(--mono);font-size:11.5px;color:var(--faint);}
+  .finds .desc{font-size:14.5px;color:var(--ink);margin:0 0 7px;}
+  .finds .ev{font-family:var(--mono);font-size:11.5px;color:var(--muted);background:var(--surface-2);border:1px solid var(--rule);border-radius:4px;padding:6px 9px;overflow-x:auto;white-space:pre;line-height:1.5;}
+  .finds .fix{font-size:13.5px;color:var(--muted);margin:7px 0 0;padding-left:0;}
+  .finds .fix b{color:var(--accent);}
+  /* table */
+  .scroll{overflow-x:auto;margin:14px 0;}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:540px;}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--rule);vertical-align:top;}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:var(--faint);font-weight:600;border-bottom:1px solid var(--rule-strong);background:var(--surface);}
+  td{font-variant-numeric:tabular-nums;}
+  td.mono,th.mono{font-family:var(--mono);font-size:12px;}
+  tr:last-child td{border-bottom:none;}
+  td .chip{font-size:10.5px;}
+  /* callout */
+  .callout{border-left:3px solid var(--accent);background:var(--accent-soft);padding:12px 15px;border-radius:0 6px 6px 0;margin:16px 0;font-size:14px;color:var(--ink);}
+  .callout b{color:var(--accent);}
+  .callout.err{border-left-color:var(--err);background:var(--err-soft);}
+  .callout.err b{color:var(--err);}
+  .callout.warn{border-left-color:var(--warn);background:var(--warn-soft);}
+  .callout.warn b{color:var(--warn);}
+  ol.refs{padding-left:20px;margin:14px 0;}
+  ol.refs li{margin-bottom:9px;font-size:14.5px;}
+  ul.bullets{padding-left:20px;margin:8px 0 14px;}
+  ul.bullets li{margin-bottom:6px;}
+  hr{border:none;border-top:1px solid var(--rule);margin:40px 0;}
+  footer{margin-top:52px;padding-top:16px;border-top:1px solid var(--rule);font-family:var(--mono);font-size:11px;color:var(--faint);}
+  @media (max-width:560px){.wrap{padding:40px 18px 64px;}h1{font-size:27px;}.finds .ev{white-space:pre-wrap;word-break:break-all;}}
+</style>
+
+<div class="wrap">
+
+  <div class="eyebrow">技术评估 · 2026-08-18</div>
+  <h1>方案正确性与可行性</h1>
+  <p class="lede">在已确认文档与 verl v0.8.0（<code>7aed6b23</code>）代码事实一致的前提下，进一步评估方案本身：
+  核心不变量能否成立、扩展点是否现实、风险是否被充分认知。结论按"成立 / 有前提 / 待验证 / 阻塞"分级。</p>
+
+  <div class="meta">
+    <span>评估对象 <b>00–08 主线 + 09 备选</b></span>
+    <span>分级 <b>成立 / 有前提 / 待验证 / 阻塞</b></span>
+    <span>依据 <b>verl 代码事实</b></span>
+  </div>
+
+  <h2><span class="n">一</span>总体判定</h2>
+  <div class="verdict">
+    <span class="chip ok">方向成立</span>
+    <span class="vt">架构分层（GS 全局大脑 / TaskRunner 控制面 / manager 本地手脚 / LB 事实源 / DDR 数据面）与 verl v0.8.0
+    的对象边界一致，控制面闭环在 Ray 原生能力内可行。<b>最大阻塞不在控制面，而在数据面与生命周期</b>：
+    HYBRID 权重路径假设训练 engine 与 rollout 在同进程共享权重，跨任务动态借卡破坏该假设，DDR 直载虽方向正确
+    但需要 verl 暴露尚未存在的 deferred-weight 加载入口。</span>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>支柱</th><th>结论</th><th>关键依赖</th><th>分级</th></tr></thead>
+    <tbody>
+      <tr><td>控制面：GS↔TaskRunner↔manager↔LB</td><td>原生可行</td><td>Ray concurrency groups（原生支持）</td><td><span class="chip ok">成立</span></td></tr>
+      <tr><td>空闲判定 + 原子摘流</td><td>设计严密</td><td>限定 SINGLE_GENERATE</td><td><span class="chip ok">成立（有前提）</span></td></tr>
+      <tr><td>activate/deactivate 预创建 replica</td><td>可复用</td><td>fully-async 已示范</td><td><span class="chip ok">成立</span></td></tr>
+      <tr><td>实时 create/destroy HYBRID replica</td><td>缺口大</td><td>无通用 teardown、无显式 placement</td><td><span class="chip warn">待验证</span></td></tr>
+      <tr><td>版本化 DDR 权重数据面</td><td>方向正确但未现成</td><td>Mooncake 是传输基础非版本化 store</td><td><span class="chip warn">待验证</span></td></tr>
+      <tr><td>跨任务借卡权重加载（DDR→HBM）</td><td>需 verl 改造</td><td>HYBRID 假设同进程共享，借卡 worker 无训练 engine</td><td><span class="chip err">阻塞</span></td></tr>
+      <tr><td>GPU 互斥 / donor 可借性</td><td>文档承认风险</td><td>同卡训练+rollout 显存与计算互斥</td><td><span class="chip warn">待验证</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2><span class="n">二</span>成立的部分</h2>
+
+  <h3>2.1 控制面闭环在 Ray 原生能力内可行</h3>
+  <ul class="finds">
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">成立</span><span class="loc">06 §2 / 04 §6.1 / 02 §2</span></div>
+      <p class="desc">sync <code>TaskRunner</code> 默认单并发裸 <code>@ray.remote</code>，<code>run()</code> 阻塞在 <code>fit()</code>。Ray 的
+      <b>threaded actor + concurrency groups</b> 是原生特性，把 <code>run/heartbeat/command</code> 分到三个并发组确实能让 GS
+      在训练运行期间响应 RPC。trainer 内部本就用 asyncio + ThreadPoolExecutor，并发不引入新机制。</p>
+      <div class="ev">main_ppo_sync.py:1756  @ray.remote（裸，无 groups）
+main_ppo_sync.py:346,373  asyncio.create_task / gather
+main_ppo_sync.py:1088  ThreadPoolExecutor  证明 trainer 内部已有并发</div>
+    </div></li>
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">成立</span><span class="loc">02 §2 / 01 §2.2</span></div>
+      <p class="desc">LB 是独立 Ray Actor，可持 GS handle 直报事实；manager 是普通对象走 TaskRunner→trainer 进入。GS detached
+      actor 有现成范式（<code>TrajectoryTracker.options(get_if_exists=True, lifetime="detached")</code>）。这条链路不依赖任何 verl 改造。</p>
+    </div></li>
+  </ul>
+
+  <h3>2.2 空闲判定与原子摘流设计严密</h3>
+  <ul class="finds">
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">成立（有前提）</span><span class="loc">07 全文</span></div>
+      <p class="desc">07 诚实地识别了 <code>ray.get()</code> 太早返回、<code>ReplayBuffer.sample()</code> 太晚返回的代码事实，并设计了
+      <code>BATCH_INPUT_EXHAUSTED</code>（首次取尽预期 trajectory）+ <code>STEP_IDLE_REPLICAS</code>（inflight 归零）两层信号，
+      用 <code>server_load_version</code> 防"观察后竞争 acquire"，<code>try_mark_draining</code> 原子摘流。这套设计在
+      <b>SINGLE_GENERATE</b> 前提下自洽，且明确把 multi-turn 排除在第一阶段外。</p>
+      <div class="fix"><b>前提</b>：第一阶段严格限定 single-generate / single-turn AgentLoop。一旦放开口子（混合 multi-turn、tool agent），
+      空闲判据立即失效——这点 07 §5.3 已明确警告，必须作为硬约束守住。</div>
+    </div></li>
+  </ul>
+
+  <h3>2.3 预创建 replica 的 activate/deactivate 可复用</h3>
+  <ul class="finds">
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">成立</span><span class="loc">05 §7 / 01 §2.3 §2.6</span></div>
+      <p class="desc">replica sleep/wake、abort/resume、LB add/remove servers 都已存在；<code>FullyAsyncLLMServerManager</code> 已示范
+      运行时改 LB 活跃集合。<b>activate/deactivate 不需要新 verl 接口</b>，可作为分阶段 PoC 先验证控制闭环。</p>
+      <div class="ev">replica.py  sleep()/wake_up()/abort_all_requests()/release_kv_cache()
+fully_async_rollouter.py:1134  add_replicas（只改活跃集合）</div>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">三</span>待验证的部分</h2>
+
+  <h3>3.1 实时 create/destroy：v0.8.0 缺通用 teardown 与显式 placement</h3>
+  <ul class="finds">
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">待验证</span><span class="loc">01 §3.4 §3.5 / 05 §7</span></div>
+      <p class="desc"><code>init_hybrid()</code> 按 <code>replica_rank</code> 连续切本任务 WG workers，无法表达 GS 给的任意 placement；
+      <code>RolloutReplica</code> 无 <code>shutdown/close/destroy</code>，<code>remove_servers()</code> 只删字典不 drain、不杀子进程。
+      文档已诚实标注这是 L3 侵入，且承认"不能靠从 Python list 删除，也不应直接 <code>ray.kill</code>"。</p>
+      <div class="ev">replica.py:138-140  workers[world_size*rank : world_size*(rank+1)]  # 只能连续切
+llm_server.py:115  remove_servers  # 只删 dict
+（grep "def shutdown|def destroy|def close" in RolloutReplica → 无）</div>
+      <div class="fix"><b>缺口属实但可控</b>：建议的 <code>init_hybrid_workers(workers, name_suffix, weight_source)</code> +
+      <code>shutdown(graceful)</code> 是 verl 的合理窄扩展。真正难的不是接口，而是 teardown 时 vLLM mp 子进程、socket、
+      server name、KV cache 的完整清理——需 PoC 验证不泄漏。</div>
+    </div></li>
+  </ul>
+
+  <h3>3.2 版本化 DDR 数据面：Mooncake 是传输基础，不是现成 store</h3>
+  <ul class="finds">
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">待验证</span><span class="loc">08 §2 / 01 §2.5 §3.6</span></div>
+      <p class="desc">文档对 Mooncake 现状的描述准确：有 <code>TransferEngine</code> + RDMA 远程 read，但 <code>update_weights()</code>
+      仍要 trainer 与 rollout 同时建临时 <code>StatelessProcessGroup</code>、buffer 在 CUDA、abort 全部 replicas、无版本化 manifest/lease/GC。
+      文档没有把 Mooncake 当现成 store，而是明确"复用传输层、store-mode backend 新建"——判断正确。</p>
+      <div class="ev">mooncake_checkpoint_engine.py:65  TransferEngine / :79  buf device=cuda
+checkpoint_engine/base.py:482-514  abort_replicas→build_process_group→resume  # 全量重建</div>
+      <div class="fix"><b>风险点</b>：store 的 manifest 原子提交、多 reader 并发 lease、content digest 校验、GC fence 都需新建实现。
+      08 §11 的 10 项最小验证覆盖了关键不变量，但<b>多 reader 并发读同一 version 的性能</b>与<b>HBM→DDR 发布对训练步的延迟影响</b>
+      尚未量化——这两项决定方案的实际收益。</div>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">四</span>阻塞点与被低估的风险</h2>
+
+  <h3>4.1 阻塞：HYBRID 权重路径与跨任务借卡根本冲突</h3>
+  <ul class="finds">
+    <li class="err"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip err">阻塞</span><span class="loc">replica.py:131 / vllm_rollout.py:170-188</span></div>
+      <p class="desc">这是评估中发现的最关键问题。HYBRID 的 docstring 明确：<b>"rollout engine and training engine
+      fused in same process"</b>。vLLM HYBRID server 通过 <code>update_weights_from_ipc</code> + <code>BucketedWeightSender</code>
+      经 zmq 从<b>同进程的训练 engine</b> 拿权重——rollout server 本身不独立加载权重。</p>
+      <p class="desc">跨任务借来的 worker 上<b>没有 receiver 任务的训练 engine</b>，ServerAdapter 的 IPC endpoint 不存在。
+      04/08 的 DDR 直载方案要成立，必须在借来的 worker 上跑一个不依赖训练 engine 的独立 rollout server 并从 DDR 填充权重——
+      这条路径在 v0.8.0 中<b>不是现成的</b>，需要 verl 暴露 deferred-weight 加载入口。</p>
+      <div class="ev">replica.py:132  docstring: "training engine fused in same process"
+vllm_rollout.py:177  "update_weights_from_ipc"        # 依赖同进程训练 engine 作 sender
+vllm_rollout.py:184  BucketedWeightSender(zmq_handle)  # IPC 通道
+vllm_async_server.py:138-140  非 HYBRID 强制 load_format=auto（从磁盘）</div>
+      <div class="fix"><b>可行路径</b>：vLLM 原生支持 <code>load_format="dummy"</code>（建空 buffer 不加载），借来 worker 用 dummy 建拓扑+空 HBM，
+      再由 <code>WeightSnapshotLoader</code> 按 manifest DDR→HBM 填充。但需要 verl 暴露：<b>(1)</b> dummy 初始化后接受外部 loader 填充的 hook；
+      <b>(2)</b> 无训练 engine 时的 ServerAdapter/IPC 替代；<b>(3)</b> server 返回实际 loaded version/digest。这三项是 01 §4.5 列的扩展点，
+      <b>当前代码均不存在</b>，是整个方案能否落地的真正咽喉。</div>
+    </div></li>
+  </ul>
+
+  <div class="callout err"><b>为什么这是阻塞而非"待验证"</b>：控制面、空闲判定、activate/deactivate 即使 verl 不改也能 PoC；
+  但跨任务借卡的权重加载（方案的核心价值——"让借来的卡服务本任务"）必须依赖 verl 尚未提供的 deferred-weight + 外部 loader 接口。
+  在这些接口落地前，方案无法实现真正的跨任务资源共享，只能做同任务内的预创建 replica 激活。</div>
+
+  <h3>4.2 被低估：GPU 互斥的物理现实</h3>
+  <ul class="finds">
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">被低估</span><span class="loc">00 §6.1 / 05 §9</span></div>
+      <p class="desc">00 §6 承认"HYBRID 资源互斥"是首要风险，05 §9 也说"worker lease 只有在训练计算、权重同步和 rollout server
+      都不访问该 GPU 时才能转交"。但文档对<b>同卡训练+rollout 共存时的显存竞争</b>着墨不足：HYBRID 下训练 engine 和 vLLM engine
+      共用 GPU 显存（<code>gpu_memory_utilization</code> 分配），donor 任务在 TRAIN 阶段若仍占用显存做反向传播，借出 GPU 给 receiver
+      跑 rollout 会撞显存上限。这不是 phase 字符串能判断的——需要真实的显存水位与计算占用信号。</p>
+      <div class="fix"><b>建议</b>：00 §6.1 应补充"donor 可借性判据必须包含显存水位与计算空闲，不能仅凭 rollout replica sleep 推断 GPU 可借"。
+      否则可能出现 GS 判定可借、实际 OOM 的情形。</div>
+    </div></li>
+  </ul>
+
+  <h3>4.3 被低估：第一阶段的隐性算法约束</h3>
+  <ul class="finds">
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">约束耦合</span><span class="loc">07 §5.3 / 04 §8.5</span></div>
+      <p class="desc">方案的三个"第一阶段"约束相互耦合：<b>sync + on-policy + HYBRID + SINGLE_GENERATE</b>。任意放宽一个，正确性不变量都会动摇：
+      放开 SINGLE_GENERATE → 空闲判据失效；放开 on-policy（如 09 的 fully-async）→ 权重版本窗口、staleness、partial rollout 全部要重设计；
+      放开 sync → 落到 09 的异步架构。文档把这四者捆在一起是<b>正确的保守选择</b>，但 README/00 应更醒目地标注"第一阶段是一个四约束整体，
+      非任意可拆"，避免实施时被逐个松绑。</p>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">五</span>09 备选方案的额外正确性负担</h2>
+  <div class="verdict">
+    <span class="chip block">备选</span>
+    <span class="vt">09 把基线从 sync 切到 fully-async，技术上与代码事实一致，但<b>引入 09 自己承认的额外正确性负担</b>：
+    partial rollout 跨版本、staleness backpressure、MessageQueue drop 与抢占恢复。这些不在主线四约束内。</span>
+  </div>
+  <ul class="finds">
+    <li class="block"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip block">负担</span><span class="loc">09 §4.2 §9.2 §16.1</span></div>
+      <p class="desc">09 §9.2 的抢占式缩容用 partial rollout 在被回收 replica 上 abort 请求、客户端到其他 replica 续生成——这要求
+      <code>partial_rollout=True</code> 且 response 跨版本 span 进入 sample metadata。09 自己在 §16.1 也建议"A1 先 graceful，A3 再启用抢占"。
+      与主线 sync + on-policy + SINGLE_GENERATE 相比，09 的正确性边界<b>显著更宽</b>，且依赖 fully-async 的 rollout-correction 路径。</p>
+      <div class="fix">09 作为"备选调研"定位正确，不改变 00 当前决策。但若未来考虑切向 09，需把它 §15 的验收不变量（每 sample 带 min/max version、
+      version window、queue drop 可观测）作为硬前置，而非可选项。</div>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">六</span>结论与建议</h2>
+
+  <div class="callout"><b>总体</b>：方案架构正确、分层清晰、风险意识充分（01 侵入分级、05 事务顺序、07 空闲两层、08 失败语义都到位）。
+  控制面可独立 PoC 验证。<b>但方案的核心价值——跨任务借卡——被一个 v0.8.0 不存在的 verl 扩展点卡住</b>（deferred-weight +
+  外部 loader + 无训练 engine 的 server adapter）。这是"方案可行"与"方案能在现 verl 上跑起来"的分水岭。</div>
+
+  <h3>建议</h3>
+  <ol class="refs">
+    <li><strong>把 4.1 的借卡权重加载作为 RFC 的第一优先项</strong>。先做最小 PoC：在 standalone-style worker 上用 <code>load_format="dummy"</code> + 外部 DDR loader 填充权重，验证 <b>无训练 engine 的 rollout server 能否独立服务正确 policy version</b>。这一项不通，其余都是同任务内优化。</li>
+    <li><strong>补强 GPU 互斥判据</strong>。00 §6.1 增加"donor 可借性需显存水位 + 计算空闲信号，不能仅凭 rollout sleep 推断"，否则 ASSIGN 后 OOM。</li>
+    <li><strong>醒目化四约束整体</strong>。README/00 标注 sync + on-policy + HYBRID + SINGLE_GENERATE 是第一阶段整体约束，非任意可拆；任意松绑需重新评估对应不变量。</li>
+    <li><strong>量化 DDR 数据面收益</strong>。在 PoC 中测 HBM→DDR 发布对训练步延迟的影响、多 reader 并发读吞吐——这是方案收益的最终证据，08 §11.10 已列但需前置。</li>
+    <li><strong>L0→L3 顺序不变</strong>。01 的逐层验证顺序正确：先 L0/L1（控制面，无 verl 改动）打通，再 L2（factory/hook，小型 RFC），最后 L3（DDR + 动态 create/destroy）。L3 前不要承诺跨任务共享。</li>
+  </ol>
+
+  <hr>
+  <footer>
+    评估依据：verl@7aed6b23 代码事实（replica.py / vllm_rollout.py / vllm_async_server.py / checkpoint_engine / fully_async_policy）+
+    文档 00–08 主线与 09 备选。分级标准：成立=代码现成且自洽；有前提=需守约束；待验证=方向对但需 PoC；阻塞=依赖 verl 尚不存在的扩展点。
+  </footer>
+
+</div>

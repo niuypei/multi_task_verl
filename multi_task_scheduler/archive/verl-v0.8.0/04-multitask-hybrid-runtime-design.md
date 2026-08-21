@@ -7,7 +7,8 @@
 
 ## 1. 已确认的设计约束
 
-1. 第一阶段使用 verl 原生 `sync + on-policy + HYBRID` 路径。
+1. 第一阶段使用 verl 原生 `GRPO + on-policy + sync + HYBRID` 路径（与
+   [`00`](../../00-project-alignment.md#1-项目目标) 的单一事实来源一致）。
 2. `GroupScheduler`、多任务协议和扩展类主要位于独立子仓，不新增通信组件。
 3. 每个训练任务仍有独立的 single controller，不把 `PPOTrainer` 或任务级 manager 改成全局对象。
 4. 子仓提供 `MultiTaskTaskRunner`、`MultiTaskPPOTrainer(PPOTrainer)`、
@@ -207,7 +208,12 @@ verl 已支持 `run_ppo(config, task_runner_class=...)` 注入自定义 TaskRunn
 
 当前 `TaskRunner.run()` 直接构造具体 `PPOTrainer`，而且 `TaskRunner` 已经被 `@ray.remote` 装饰，
 模块中导出的符号是 Ray `ActorClass`，不能直接作为普通 Python 基类继承。子仓原型需要定义新的
-runner implementation，再将它包装成 remote actor：
+runner implementation，再将它包装成 remote actor。
+
+> 下面的代码是子仓原型的建议写法。verl v0.8.0 的 sync `TaskRunner` 是默认单并发 Ray Actor（裸
+> `@ray.remote`，无 concurrency groups），`@ray.method(concurrency_group=...)` 与
+> `concurrency_groups={...}` 都是子仓新增的控制面扩展，不是上游现状；背景与并发隔离论证见
+> [`06`](./06-taskrunner-direct-control-plane.md#2-为什么当前-taskrunner-不能直推)。
 
 ```python
 class MultiTaskTaskRunnerImpl:
@@ -378,7 +384,17 @@ manager 不持有 GS handle。创建 LB 时可以接收 GS handle 作为构造�
 GS 在子仓中实现为 named detached Ray Actor。create-or-get helper 需要固定 actor name 和 namespace，
 并在取得已有 actor 后校验协议版本与不可变调度配置。
 
-模拟器的算法和账本语义可以复用，但 callback 目标需要改为 TaskRunner ActorHandle：
+模拟器的算法和账本语义可以复用，但 callback 目标需要改为 TaskRunner ActorHandle。
+
+> 模拟器仓库 `/Users/nyp/Documents/multi-rl-task-scheduler` 存在两个 `GroupScheduler` 实现：
+> 生产模拟器 `group_scheduler/group_scheduler.py`（`@yr.instance`，benchmark 使用）和协议骨架
+> `src/multi_rl_task_scheduler/`（对齐 spec 的最小骨架）。下面"原有接口"指骨架的 callback
+> 模式；生产模拟器的 `register_task(config)` 无 `scheduler` 参数，assign/reclaim 走
+> `TaskInfo.assign.invoke` 的 yr callable（方法名 `concurrent_assign/concurrent_reclaim`），且**没有
+> `unregister_task`**。算法和账本语义两者一致，但接口形态不同。完整映射见
+> [`02`](../../02-group-scheduler-protocol.md#1-模拟器原型到-verl-的映射)。
+
+骨架原有的 callback 接口为：
 
 ```text
 register_task(config, scheduler)
@@ -386,7 +402,8 @@ scheduler.assign(...)
 scheduler.reclaim(...)
 ```
 
-调整为 TaskRunner 双向控制协议和 LB 单向事实协议：
+调整为 TaskRunner 双向控制协议和 LB 单向事实协议（均为子仓目标设计，模拟器当前未实现
+heartbeat/command/step-idle/session fencing）：
 
 ```text
 register_task(registration_with_task_runner_handle) -> registration_result
@@ -396,8 +413,9 @@ TaskRunner.apply_schedule_command(command) -> command_result
 unregister_task(task_id, session_id)
 ```
 
-GS 构造时也不应一次性接收最终 worker 集合。训练任务会动态加入公共 Ray 集群，worker inventory
-随每个 task/session 注册和退出而变化。
+GS 构造时也不应一次性接收最终 worker 集合（骨架在 `__init__` 接收 worker 列表，生产模拟器在
+`create()` 一次性生成全量 worker；两者都不支持任务动态加入）。训练任务会动态加入公共 Ray 集群，
+worker inventory 随每个 task/session 注册和退出而变化。
 
 ## 7. 可直接复用与需要调整的接口
 
@@ -467,7 +485,9 @@ TaskRunner → trainer → manager                 # 本地执行
 manager → trainer → TaskRunner → GS            # 实际结果
 ```
 
-TaskRunner 使用 `training=1`、`heartbeat=1`、`command=1` 三个 concurrency groups。command 与 trainer
+改造后的 `MultiTaskTaskRunner` 将划分 `training=1`、`heartbeat=1`、`command=1` 三个 concurrency
+groups（verl v0.8.0 现状是单并发裸 `@ray.remote`，无此分组；详见
+[`06`](./06-taskrunner-direct-control-plane.md#2-为什么当前-taskrunner-不能直推)）。command 与 trainer
 主线程会同时触及 manager、LB 和 CE，因此必须共享生命周期锁/串行命令队列；phase 切换、权重同步和
 replica 事务不能并发修改 CE 集合。heartbeat 只读取最近 committed immutable snapshot，不进入
 manager 的耗时生命周期事务。

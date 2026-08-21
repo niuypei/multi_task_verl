@@ -97,7 +97,7 @@ flowchart TB
 `GroupScheduler` 是子仓实现的 Ray Actor：
 
 - 使用固定名称、固定 namespace 和 detached lifetime，所有任务的 single controller 都执行原子的 create-or-get，最终获得同一 actor handle。
-- 保存任务表、TaskRunner handles、worker/placement 表、心跳租约、状态版本和待执行决策。
+- 保存任务表、TaskRunner handles、worker/placement 表、sleeping inference slots、心跳租约、状态版本和待执行决策。
 - 接收 TaskRunner 注册/注销；主动探测 TaskRunner，获取最近 committed 资源快照。
 - 接收各任务 GlobalRequestLoadBalancer 直接上报的 step-idle replicas 事实。
 - 运行可替换的调度策略，生成 `ASSIGN` / `RECLAIM` 命令；ASSIGN 携带已提交的
@@ -140,6 +140,7 @@ GS 经 TaskRunner 下发的跨任务 placement。manager 内不再运行 heartbe
 - 通过 manager factory 创建 `MultiTaskLLMServerManager`；
 - 在原生 `init_workers()` 完成后绑定 CE，并向 TaskRunner 暴露 committed snapshot；
 - 向 manager 通知 `ROLLOUT_READY/ROLLOUT_RUNNING/ROLLOUT_DRAINED/TRAIN/WEIGHT_SYNC/EXITING`；
+- 在进入会重新占用 donor GPU HBM 的训练阶段前，等待本任务借出的 sleeping slots 被 receiver 摘流、销毁并归还；
 - 将 GS 命令转交 manager，并返回 committed/rejected 结果；
 - 不读取 GS placement，不直接执行 add/remove，不改变 PPO/GRPO 算法。
 
@@ -163,7 +164,8 @@ GS 经 TaskRunner 下发的跨任务 placement。manager 内不再运行 heartbe
 - publisher 在 snapshot commit 后不再参与读路径，因此 rollout 中训练侧不可用不影响动态扩容；
 - 当前 verl Mooncake checkpoint engine 可复用 TransferEngine，但其临时 P2P 拓扑不是现成的版本化 store。
 
-详细设计见 [`08-versioned-ddr-weight-store.md`](./08-versioned-ddr-weight-store.md)。
+详细设计见
+[`08-versioned-ddr-weight-store.md`](./archive/verl-v0.8.0/08-versioned-ddr-weight-store.md)。
 
 ## 4. 控制闭环
 
@@ -205,17 +207,35 @@ GlobalRequestLoadBalancer 另持有 GS handle。对于 SINGLE_GENERATE，当唯�
 
 ### 4.3 决策与执行
 
-1. GS 基于最新 committed snapshot 生成带 `decision_id`、`expected_state_version` 的命令；ASSIGN 还
-   携带与目标 generation 匹配的 committed `WeightSnapshotRef`。
-2. GS 通过已注册的 TaskRunner handle 下发命令。
-3. TaskRunner 经 trainer 调用 MultiTaskLLMServerManager；manager 检查版本、phase 和幂等性，创建
-   replica 并完成 DDR→HBM 加载、digest 校验、warmup 后才加入 LB。
-4. 结果沿 manager→trainer→TaskRunner→GS 返回，包含实际成功的 replica/worker、失败原因和新状态版本。
-5. GS 根据执行结果提交账本；部分成功或失败时重新规划。
+1. donor LB 上报某原 replica 已 input-exhausted 且 inflight 为零；GS 仍把它当作 ACTIVE observation，不直接
+   分配 GPU。
+2. GS 对 donor 下发 RECLAIM；donor manager 在本任务 LB 内原子摘流、drain 并 sleep 原 replica，保留原
+   server/backend、training workers 和 PG，只把实际释放 HBM 的同卡 slot lease 返回 GS。
+3. GS 对 receiver 下发 `ASSIGN(CREATE_BORROWED, slot, WeightSnapshotRef)`；receiver manager 在 slot 指定的
+   相同物理卡上新建 vLLM replica/server，从 DDR 装载本任务权重，校验和 warmup 后才加入 receiver LB。
+4. donor 即将训练或 lease 到期时，GS 先 RECLAIM receiver；receiver 从 LB 摘流并销毁动态 backend，确认 HBM
+   释放后归还 slot。donor 收回 HBM 使用权后，按自身 phase 保持原 replica sleep、进入训练或恢复原 replica。
+5. 每一步结果都沿 manager→trainer→TaskRunner→GS 返回；GS 只根据实际 committed slot/replica 状态推进账本。
 
 GS 不直接 RPC 本地 Python manager，而是调用 TaskRunner Ray Actor，再由它通过 trainer 的线程安全窄接口
 进入 manager。LB→GS 只上报事实，命令始终沿 GS→TaskRunner→trainer→manager 执行。ASSIGN/RECLAIM
 可以在本轮 rollout 尚未结束时生效。
+
+### 4.4 共享卡场景的三张权威视图
+
+donor replica sleep、receiver 在同卡创建新 replica 后，系统有三张职责不同的视图：
+
+| 视图 | 权威范围 |
+|---|---|
+| Ray ResourcePool/Placement Group | 物理 GPU、Worker Actor 和任务 session 的基础 ownership/lifecycle |
+| GS sleeping-slot ledger | donor 释放的 HBM 当前由哪个 receiver 临时使用，以及 lease/epoch/归还状态 |
+| 每任务 LoadBalancer | 当前哪些 server 可以接收该任务请求 |
+
+三张视图不要求内容相同：Ray 中 GPU 仍属于 donor，GS 中 HBM slot 可属于 receiver，receiver LB 中新 server
+可以 ACTIVE。但它们必须以 task/session/replica/slot epoch 关联，并按“donor 摘流与 sleep→slot AVAILABLE→
+receiver create/load/warmup→receiver LB add→slot ASSIGNED”提交。归还时必须先从 receiver LB 摘流并销毁
+receiver backend、确认 HBM 释放，才能解除 donor 的 training phase gate。LB remove 不等于 HBM 已释放，
+Ray ownership 也不等于 GPU 当前没有 borrower。
 
 ## 5. 子仓与 verl 的边界
 
@@ -241,7 +261,8 @@ GS 不直接 RPC 本地 Python manager，而是调用 TaskRunner Ray Actor，再
 | 运行时删除 replica | load balancer 能移除地址，但无通用 shutdown | 为 RolloutReplica 增加 drain/shutdown，并保证子进程与 actor 清理 |
 | 同步配套状态更新 | LB 和 CheckpointEngineManager 各有局部 add/remove 能力 | 提供统一事务顺序，避免 replica、LB、checkpoint manager 三份状态分裂 |
 | phase/版本通知 | sync trainer 没有通用 lifecycle hook | 增加轻量 hook，或由子仓 PPOTrainer 子类覆盖关键边界 |
-| 任意 HYBRID worker binding | `init_hybrid()` 按 replica rank 切固定本任务 worker group | 支持以显式 worker handles 初始化 replica，并定义跨任务 worker lease |
+| 同卡创建 borrowed HYBRID replica | `init_hybrid()` 按 replica rank 切固定本任务 worker group | 支持从 donor sleep 结果传入显式 node/GPU/anchor handles；Ray ownership 不转移，只建立有 epoch 的 HBM slot lease |
+| 跨任务复用 ResourcePool/WorkerGroup | 二者都是各自 controller 内普通对象，WorkerGroup 还绑定本任务 rank/method dispatch | 不传递整个对象；slot 只携带 donor 原 replica 的有序 WorkerDict ActorHandles 和 PG/bundle provenance，receiver 直接按 handles 启动 server |
 | 动态 replica 权重 | naive 路径绑定本任务 ActorRolloutRefWorker/ServerAdapter；现有 Mooncake backend 仍要求 trainer 与 rollout 同时参与临时 P2P 拓扑 | 提供 versioned DDR snapshot publish/load hook；trainer 发布后退出读路径，rollout worker 按 ref 直接 DDR→HBM 并校验 digest |
 
 在没有上游扩展点时，可以通过自定义 recipe、remote runner、MultiTaskPPOTrainer 和 manager 完成
@@ -250,12 +271,15 @@ GS 不直接 RPC 本地 Python manager，而是调用 TaskRunner Ray Actor，再
 
 ## 6. 必须正面验证的技术风险
 
-1. **HYBRID 资源互斥**：模拟器把 worker 视为可分配 GPU；真实 HYBRID GPU 同时受训练 worker、PG 和显存状态约束。GS 分配前必须确认 donor phase 与 worker lease，不能仅根据“rollout idle”判断 GPU 可用。
+1. **HYBRID 资源互斥**：模拟器把 worker 视为可分配 GPU；真实场景中 donor 的 training worker、PG 和 sleeping
+   server 都不转移。GS 只能分配 donor LB 摘流、drain、sleep 后实际返回的 HBM slot，且 donor 进入训练前必须
+   收回 slot；不能仅根据“rollout idle”判断 GPU 可用。
 2. **版本化 DDR 权重数据面**：借入 worker 上的新 replica 必须从本任务 committed snapshot 加载正确
    policy version。需要 PoC 验证 HBM→DDR 发布、DDR→HBM 加载、rank shard plan、digest、lease/GC，
    以及 Mooncake backend 在训练侧不参与读路径时的生命周期和吞吐。
 3. **动态销毁安全性**：v0.8.0 没有通用 vLLM replica teardown。直接 `ray.kill` 可能遗留 mp 子进程、socket、缓存和本地账本。
-4. **控制面一致性**：reclaim 完成后必须使用新 worker snapshot 做 placement；模拟器已经出现过使用旧快照导致计划无法交付的问题。
+4. **控制面一致性**：donor sleep 完成后必须使用新 slot snapshot 做 placement；receiver 销毁并确认 HBM 释放前
+   不能解除 donor phase gate。模拟器已经出现过使用旧快照导致计划无法交付的问题。
 5. **命名与隔离**：多任务共享 namespace 后，vLLM server actor 名、replica rank 和临时 IPC 路径必须包含 task/session 标识。
 6. **故障恢复**：GS detached actor、TaskRunner/LB 重连和任务重启时，需要 session fencing，避免旧 endpoint、旧事件或旧命令更新状态。
 

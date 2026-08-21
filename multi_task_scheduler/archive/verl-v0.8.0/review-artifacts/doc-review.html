@@ -1,0 +1,497 @@
+<title>调度文档审视</title>
+<style>
+  :root{
+    --ground:#F4F3EF;
+    --surface:#FBFAF7;
+    --surface-2:#FFFFFF;
+    --ink:#1E2024;
+    --muted:#595B63;
+    --faint:#7C7E86;
+    --rule:#E0DFD9;
+    --rule-strong:#C9C8C1;
+    --accent:#2F5566;
+    --accent-soft:#E3ECEF;
+    --ok:#2E7D52;
+    --ok-soft:#E4EFE8;
+    --warn:#9A6A1C;
+    --warn-soft:#F3EAD6;
+    --err:#A8362F;
+    --err-soft:#F2E1DF;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --serif:Georgia,"Iowan Old Style","Palatino Linotype",Palatino,"Times New Roman",serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#15171B;
+      --surface:#1C1F25;
+      --surface-2:#202329;
+      --ink:#E7E6E1;
+      --muted:#A2A4AC;
+      --faint:#7A7C84;
+      --rule:#2A2D33;
+      --rule-strong:#3A3D44;
+      --accent:#8FB4C6;
+      --accent-soft:#1F2D33;
+      --ok:#7FCB9C;
+      --ok-soft:#1E2A22;
+      --warn:#D6A85C;
+      --warn-soft:#2A2418;
+      --err:#E07A72;
+      --err-soft:#2C1E1C;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#15171B;
+    --surface:#1C1F25;
+    --surface-2:#202329;
+    --ink:#E7E6E1;
+    --muted:#A2A4AC;
+    --faint:#7A7C84;
+    --rule:#2A2D33;
+    --rule-strong:#3A3D44;
+    --accent:#8FB4C6;
+    --accent-soft:#1F2D33;
+    --ok:#7FCB9C;
+    --ok-soft:#1E2A22;
+    --warn:#D6A85C;
+    --warn-soft:#2A2418;
+    --err:#E07A72;
+    --err-soft:#2C1E1C;
+  }
+  *{box-sizing:border-box;}
+  html{background:var(--ground);}
+  body{
+    margin:0;
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  .wrap{
+    max-width:760px;
+    margin:0 auto;
+    padding:56px 28px 96px;
+  }
+  /* header */
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:11.5px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    color:var(--accent);
+    margin-bottom:14px;
+  }
+  h1{
+    font-family:var(--serif);
+    font-size:34px;
+    line-height:1.18;
+    font-weight:600;
+    margin:0 0 14px;
+    letter-spacing:-0.01em;
+    text-wrap:balance;
+  }
+  .lede{
+    font-size:16.5px;
+    color:var(--muted);
+    margin:0 0 6px;
+    max-width:62ch;
+  }
+  .meta{
+    font-family:var(--mono);
+    font-size:12px;
+    color:var(--faint);
+    margin-top:18px;
+    padding-top:14px;
+    border-top:1px solid var(--rule);
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px 18px;
+  }
+  .meta span b{color:var(--ink);font-weight:600;}
+  /* sections */
+  h2{
+    font-family:var(--serif);
+    font-size:21px;
+    font-weight:600;
+    margin:52px 0 4px;
+    letter-spacing:-0.005em;
+    text-wrap:balance;
+  }
+  h2 .n{
+    font-family:var(--mono);
+    font-size:13px;
+    color:var(--accent);
+    margin-right:10px;
+    font-weight:500;
+    letter-spacing:0.04em;
+  }
+  h3{
+    font-family:var(--sans);
+    font-size:14.5px;
+    font-weight:600;
+    margin:26px 0 8px;
+    color:var(--ink);
+    letter-spacing:0.005em;
+  }
+  p{margin:0 0 13px;}
+  p code,li code,.inline-code{
+    font-family:var(--mono);
+    font-size:12.5px;
+    background:var(--surface-2);
+    border:1px solid var(--rule);
+    padding:1px 5px;
+    border-radius:4px;
+    color:var(--ink);
+    word-break:break-all;
+  }
+  .lead{color:var(--muted);}
+  strong{color:var(--ink);font-weight:600;}
+  /* verdict banner for each doc section */
+  .verdict{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin:10px 0 18px;
+    padding:9px 13px;
+    border-radius:6px;
+    border:1px solid var(--rule);
+    background:var(--surface);
+    font-size:13.5px;
+  }
+  .verdict .chip{flex-shrink:0;}
+  .verdict .vt{color:var(--muted);}
+  .verdict .vt b{color:var(--ink);}
+  /* chips */
+  .chip{
+    font-family:var(--mono);
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:0.03em;
+    padding:2px 8px;
+    border-radius:3px;
+    white-space:nowrap;
+    display:inline-block;
+  }
+  .chip.ok{background:var(--ok-soft);color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 30%,transparent);}
+  .chip.warn{background:var(--warn-soft);color:var(--warn);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);}
+  .chip.err{background:var(--err-soft);color:var(--err);border:1px solid color-mix(in srgb,var(--err) 30%,transparent);}
+  .chip.neutral{background:var(--surface-2);color:var(--muted);border:1px solid var(--rule);}
+  /* finding list */
+  .finds{list-style:none;margin:14px 0 8px;padding:0;}
+  .finds li{
+    display:flex;
+    gap:12px;
+    padding:12px 0;
+    border-bottom:1px solid var(--rule);
+  }
+  .finds li:last-child{border-bottom:none;}
+  .finds .stripe{
+    flex:0 0 3px;
+    align-self:stretch;
+    border-radius:2px;
+    background:var(--rule-strong);
+    min-height:100%;
+  }
+  .finds li.ok .stripe{background:var(--ok);}
+  .finds li.warn .stripe{background:var(--warn);}
+  .finds li.err .stripe{background:var(--err);}
+  .finds .body{flex:1;min-width:0;}
+  .finds .head{
+    display:flex;
+    align-items:baseline;
+    gap:9px;
+    flex-wrap:wrap;
+    margin-bottom:3px;
+  }
+  .finds .loc{
+    font-family:var(--mono);
+    font-size:11.5px;
+    color:var(--faint);
+  }
+  .finds .desc{font-size:14.5px;color:var(--ink);margin:0 0 5px;}
+  .finds .ev{
+    font-family:var(--mono);
+    font-size:11.5px;
+    color:var(--muted);
+    background:var(--surface-2);
+    border:1px solid var(--rule);
+    border-radius:4px;
+    padding:5px 8px;
+    overflow-x:auto;
+    white-space:pre;
+    line-height:1.5;
+  }
+  /* summary table */
+  .scroll{overflow-x:auto;margin:14px 0;}
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:13px;
+    min-width:560px;
+  }
+  th,td{
+    text-align:left;
+    padding:9px 12px;
+    border-bottom:1px solid var(--rule);
+    vertical-align:top;
+  }
+  th{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+    color:var(--faint);
+    font-weight:600;
+    border-bottom:1px solid var(--rule-strong);
+    background:var(--surface);
+  }
+  td{font-variant-numeric:tabular-nums;}
+  td.mono,th.mono{font-family:var(--mono);font-size:12px;}
+  tr:last-child td{border-bottom:none;}
+  td .chip{font-size:10.5px;}
+  /* notes / recommendations */
+  ol.refs{padding-left:20px;margin:14px 0;}
+  ol.refs li{margin-bottom:9px;font-size:14.5px;}
+  ul.bullets{padding-left:20px;margin:8px 0 14px;}
+  ul.bullets li{margin-bottom:6px;}
+  /* callout */
+  .callout{
+    border-left:3px solid var(--accent);
+    background:var(--accent-soft);
+    padding:12px 15px;
+    border-radius:0 6px 6px 0;
+    margin:16px 0;
+    font-size:14px;
+    color:var(--ink);
+  }
+  .callout b{color:var(--accent);}
+  hr{border:none;border-top:1px solid var(--rule);margin:40px 0;}
+  footer{
+    margin-top:52px;
+    padding-top:16px;
+    border-top:1px solid var(--rule);
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--faint);
+  }
+  @media (max-width:560px){
+    .wrap{padding:40px 18px 64px;}
+    h1{font-size:27px;}
+    .finds .ev{white-space:pre-wrap;word-break:break-all;}
+  }
+</style>
+
+<div class="wrap">
+
+  <div class="eyebrow">事实核验报告 · 2026-08-18</div>
+  <h1>调度文档审视</h1>
+  <p class="lede">对照 verl v0.8.0（commit <code>7aed6b23</code>）与 GroupScheduler 模拟器代码，逐条核验
+  <code>04-multitask-hybrid-runtime-design.md</code> 与 <code>09-verl-async-standalone-runtime-research.md</code>
+  对代码事实的声称是否属实，并标注错漏。</p>
+
+  <div class="meta">
+    <span>基线 <b>verl@7aed6b23</b></span>
+    <span>模拟器 <b>multi-rl-task-scheduler</b></span>
+    <span>核查项 <b>40+</b></span>
+  </div>
+
+  <h2><span class="n">一</span>总体结论</h2>
+  <p>三份相关文档的准确度分层明显，<strong>09 最准确、04 次之、02/04§6.4 对模拟器的声称问题最大</strong>。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>文档</th><th class="mono">声称数</th><th>一致</th><th>措辞/歧义</th><th>实质问题</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr><td>09 异步分离调研</td><td class="mono">12</td><td class="mono">12</td><td class="mono">0</td><td class="mono">0</td><td><span class="chip ok">一致</span></td></tr>
+      <tr><td>04 多任务混合设计</td><td class="mono">18</td><td class="mono">15</td><td class="mono">2</td><td class="mono">1*</td><td><span class="chip warn">部分</span></td></tr>
+      <tr><td>02 / 04§6.4 对模拟器</td><td class="mono">8</td><td class="mono">3</td><td class="mono">1</td><td class="mono">4</td><td><span class="chip err">差异</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="lead">* 04 的 1 条实质问题集中在"把建议的新模式表述为现状"；其基线代码声称本身高度准确。下文按文档展开，证据格式为 <code>文件:行号</code>。</p>
+
+  <h2><span class="n">二</span>文档 09 — 异步分离调研</h2>
+  <div class="verdict">
+    <span class="chip ok">一致</span>
+    <span class="vt">对 fully-async 代码的 12 条高风险声称全部经直接验证属实，<b>无需修改事实部分</b>。</span>
+  </div>
+
+  <ul class="finds">
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§17 代码索引</span></div>
+      <p class="desc">所列 10 个代码路径全部存在，类名与位置准确。</p>
+      <div class="ev">verl/experimental/fully_async_policy/{fully_async_main,
+fully_async_trainer,fully_async_rollouter,message_queue,detach_utils}.py
+verl/experimental/separation/engine_workers.py  DetachActorWorker
+verl/experimental/one_step_off_policy/ray_trainer.py  OneStepOffRayTrainer</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§4.1 staleness 重置公式</span></div>
+      <p class="desc">声称 reset 后 <code>staleness_samples = len(active_tasks) + MessageQueue.queue_size</code>，与代码逐字一致。</p>
+      <div class="ev">fully_async_rollouter.py:575
+  self.staleness_samples = len(self.active_tasks)
+    + await self.message_queue_client.get_queue_size()</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§4.1 max_required_samples 公式</span></div>
+      <p class="desc">声称 <code>required_samples × (staleness_threshold+1) × trigger_parameter_sync_step</code>，与代码一致。</p>
+      <div class="ev">fully_async_rollouter.py:531-534
+  self.max_required_samples = int(self.required_samples
+    * (self.staleness_threshold + 1)
+    * self.config.async_training.trigger_parameter_sync_step)</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§6.2 / §7.3 / §8.1</span></div>
+      <p class="desc">Rollouter <code>max_concurrency=100</code>；TaskRunner 阻塞于 <code>ray.wait</code> 且无 concurrency group；<code>add_replicas</code> 只激活预注册 HYBRID replicas，不创建新 standalone PG/workers。</p>
+      <div class="ev">fully_async_rollouter.py:392  @ray.remote(num_cpus=10, max_concurrency=100)
+fully_async_main.py:35   @ray.remote(num_cpus=1)        # 无 concurrency_groups
+fully_async_main.py:188  ray.wait(futures, num_returns=1, timeout=None)
+fully_async_trainer.py:569  get_all_hybrid_replicas / 571  add_replicas.remote(hybrid_resource_ids)</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§3.2 / §3.3 / §4.1 / §10.1 / §11.2</span></div>
+      <p class="desc"><code>use_trainer_do_validate</code> 语义、CheckpointEngineManager 在 Trainer 进程内、MessageQueue 满时删最旧样本、CE <code>update_weights</code> abort 全部 replicas 后重建临时拓扑再恢复、checkpoint 注释承认 in-flight 丢失——均与代码一致。</p>
+      <div class="ev">config/fully_async_ppo_trainer.yaml:26  use_trainer_do_validate: False
+fully_async_trainer.py:171  self.checkpoint_manager = CheckpointEngineManager(...)
+message_queue.py:66-72    # If queue full, remove oldest sample ... popleft()
+checkpoint_engine/base.py:482-514  abort_replicas → build_process_group → resume
+fully_async_rollouter.py:613  # WARNING!: ... there are some in-flight samples</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§2.2 OneStepOffRayTrainer</span></div>
+      <p class="desc">声称无独立 Trainer/Rollouter Actor、无跨二者 MessageQueue，与代码一致。</p>
+      <div class="ev">one_step_off_policy/ray_trainer.py:50  class OneStepOffRayTrainer(SeparateRayPPOTrainer)
+（该文件 grep "MessageQueue" 无结果）</div>
+    </div></li>
+  </ul>
+
+  <div class="callout"><b>09 备注</b>：唯一可补强的是 §7.3 提到 <code>max_concurrent_samples = initial_replica_count × 16</code>，代码在 <code>fully_async_rollouter.py:542</code> 还有一句 <code>min(..., max_required_samples)</code> 的上限——属轻微遗漏，不影响"只在初始化时计算、需改为可更新"的结论。</div>
+
+  <h2><span class="n">三</span>文档 04 — 多任务混合设计</h2>
+  <div class="verdict">
+    <span class="chip warn">部分一致</span>
+    <span class="vt">18 条基线声称中 <b>15 条准确</b>；2 条把"建议的新原型"表述得像现状；1 条与 00 的算法名不一致。</span>
+  </div>
+
+  <h3>已确认准确的基线声称（节选）</h3>
+  <ul class="finds">
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">§2 / §3 / §6.2 / §7</span></div>
+      <p class="desc">TaskRunner 是 <code>@ray.remote</code> ActorClass、PPOTrainer 是普通对象、<code>init_workers</code> 写死 <code>LLMServerManager.create</code>、<code>run_ppo</code> 支持 <code>task_runner_class</code>、PPOTrainer.<code>__init__</code> 三参数签名、<code>init_hybrid</code> 按 rank 连续切 WG、<code>RayWorkerGroup(worker_handles=)</code>、Mooncake <code>TransferEngine</code>+buffer 在 CUDA、finally 只关 RB/TQ、初始 replica = WG world_size / replica world_size、footprint 含 <code>tp×dp×pp</code> 与 PD disaggregation、LB <code>add_servers/remove_servers/get_status</code>、CE <code>add_replicas/remove_replicas</code>。</p>
+      <div class="ev">main_ppo_sync.py:1756(@ray.remote) :501(class PPOTrainer) :712-714(create 写死) :1837-1840(finally RB/TQ)
+main_ppo.py:52(run_ppo task_runner_class)  replica.py:131-140(init_hybrid slice)
+ray/base.py:432,509(worker_handles)  llm_server.py:100/115/136(LB) 297-302(num_replicas)
+checkpoint_engine/base.py:414/422(CE add/remove) 482-514(update_weights)
+mooncake_checkpoint_engine.py:65(TransferEngine) 79(buf device=cuda)
+llm_server.py:283-296(PD disaggregation footprint)</div>
+    </div></li>
+  </ul>
+
+  <h3>需要修正的条目</h3>
+  <ul class="finds">
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">措辞</span><span class="loc">§6.1 代码示例 + §8.2</span></div>
+      <p class="desc">示例用 <code>@ray.method(concurrency_group=...)</code> 与 <code>concurrency_groups={training:1,heartbeat:1,command:1}</code>，并称"TaskRunner 使用三个 concurrency groups"。但 <strong>verl 全仓库没有任何 <code>@ray.method</code> 或 <code>concurrency_groups</code> 用法</strong>，sync TaskRunner 只用裸 <code>@ray.remote</code>。这是<b>建议的新原型模式，不是 v0.8.0 现状</b>；§6.1 末尾已部分标注为建议，但 §8.2 用现在时"使用"易被误读为既成事实。</p>
+      <div class="ev">main_ppo_sync.py:1756  @ray.remote      # 仅此，无 concurrency_groups
+全仓库 grep "ray.method|concurrency_groups" → 0 命中</div>
+    </div></li>
+
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">不一致</span><span class="loc">§1 约束第 1 条</span></div>
+      <p class="desc">04 写"<b>sync + on-policy + HYBRID</b>"，而 00 §1 写"<b>GRPO + on-policy + sync + HYBRID</b>"。04 省略了算法名 GRPO，与 00 的单一事实来源不一致。04 §8 又出现"PPO/GRPO 算法"，说明作者知晓算法范围，属遗漏而非误解。</p>
+      <div class="ev">00-project-alignment.md:10  GRPO + on-policy + sync + HYBRID
+04-multitask-hybrid-runtime-design.md:10  sync + on-policy + HYBRID</div>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">四</span>02 / 04§6.4 对模拟器 — 实质性差异</h2>
+  <div class="verdict">
+    <span class="chip err">差异</span>
+    <span class="vt">模拟器仓库存在<b>两个 GroupScheduler 实现</b>，文档未区分，导致多处声称只对骨架成立、对生产模拟器不成立。</span>
+  </div>
+
+  <div class="callout"><b>根因</b>：<code>/Users/nyp/Documents/multi-rl-task-scheduler</code> 下有两个实现——
+  <b>生产模拟器</b> <code>group_scheduler/group_scheduler.py:64</code>（<code>@yr.instance</code>，benchmark 实际使用）与
+  <b>协议骨架</b> <code>src/multi_rl_task_scheduler/group_scheduler.py:18</code>（自述"对齐 spec 的最小骨架，非完整生产调度器"）。
+  04§6.4 与 02 的"模拟器"指向不清，是所有差异的源头。</div>
+
+  <ul class="finds">
+    <li class="err"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip err">实质</span><span class="loc">04 §6.4 "模拟器原有接口"</span></div>
+      <p class="desc">声称模拟器原有接口为 <code>register_task(config, scheduler)</code> / <code>scheduler.assign(...)</code> / <code>scheduler.reclaim(...)</code>。该 callback 模式<strong>只对骨架 <code>src/</code> 成立</strong>；生产模拟器 <code>register_task(config)</code> 无 scheduler 参数，assign/reclaim 走 <code>TaskInfo.assign.invoke</code> 的 yr callable，方法名是 <code>concurrent_assign/concurrent_reclaim</code>。</p>
+      <div class="ev">src/.../interfaces.py:21  register_task(self, config, scheduler: InferScheduler)
+group_scheduler/group_scheduler.py:129  def register_task(self, config: TaskConfig) -> bool
+group_scheduler/group_scheduler.py:1589 concurrent_reclaim / :1597 concurrent_assign</div>
+    </div></li>
+
+    <li class="err"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip err">实质</span><span class="loc">04 §6.4 + 02 §4.1 unregister_task</span></div>
+      <p class="desc">两文档都把 <code>unregister_task(task_id, session_id)</code> 列为接口。<strong>生产模拟器完全无此方法</strong>（grep 无命中）；骨架仅有单参数 <code>unregister_task(task_id)</code>，无 session_id。</p>
+      <div class="ev">group_scheduler/group_scheduler.py  grep "unregister" → 0 命中
+src/.../group_scheduler.py:75  def unregister_task(self, task_id)   # 无 session_id</div>
+    </div></li>
+
+    <li class="err"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip err">实质</span><span class="loc">02 全套目标协议</span></div>
+      <p class="desc">02 的 heartbeat/probe、<code>apply_schedule_command</code>、<code>report_step_idle_replicas</code>/<code>STEP_IDLE_REPLICAS</code>、<code>session_id</code>、<code>task_runner_handle</code>/<code>ActorHandle</code>——<strong>在两个模拟器实现中均无任何匹配</strong>。模拟器状态是被动 <code>report_state</code>，空闲由 GS 内部按 <code>idle_instances</code> 计算，无 LB 单向事件通道。02 是目标设计，非现状。</p>
+      <div class="ev">全仓 grep "heartbeat|probe_seq|apply_schedule_command|STEP_IDLE_REPLICAS|session_id|task_runner_handle" → 0 命中
+group_scheduler.py:135  def report_state(self, state, need_schedule=True)</div>
+    </div></li>
+
+    <li class="err"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip err">实质</span><span class="loc">02 §1 映射表 类名</span></div>
+      <p class="desc">映射表把 <code>InferScheduler / RlxfScheduler</code> 当作模拟器实际组件。<strong><code>RlxfScheduler</code> 全仓不存在</strong>；<code>InferScheduler</code> 仅是骨架抽象基类，生产侧由 <code>GSAdapter</code> 的 <code>expand_callback/reclaim_callback</code> 模拟任务执行。</p>
+      <div class="ev">全仓 grep "RlxfScheduler" → 0 命中
+src/.../interfaces.py:9  class InferScheduler(ABC)   # 仅骨架
+gs-simulator/core/gs_adapter.py:1056-1066  expand_callback / reclaim_callback</div>
+    </div></li>
+
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">命名</span><span class="loc">02 §3.5 / 04 §10.3 decision_id</span></div>
+      <p class="desc">文档用 <code>decision_id</code>，生产模拟器实际用 <code>action_id</code>（<code>V2ActionRecord.action_id</code>、<code>_next_v2_action_id</code>）。概念对应，命名不符。<code>decision_id</code> 全仓 0 命中。</p>
+      <div class="ev">group_scheduler.py:46  action_id: str / :738  _next_v2_action_id</div>
+    </div></li>
+
+    <li class="warn"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip warn">语义</span><span class="loc">04/02 lease</span></div>
+      <p class="desc">文档所述 lease 是"跨任务 worker 借用租约"，而模拟器的 <code>leases</code> 是 reclaim 事务的<b>内部 worker token</b>（<code>prepare_external_no_sleep_reclaim</code> 等），二者概念不同；跨任务借用租约在模拟器中未实现。</p>
+      <div class="ev">data_class.py:16  ReclaimConfirm.leases
+worker.py:191,223-263  prepare/commit/cancel_no_sleep_reclaim</div>
+    </div></li>
+
+    <li class="ok"><span class="stripe"></span><div class="body">
+      <div class="head"><span class="chip ok">一致</span><span class="loc">04 §6.4 / §10.1 算法与账本</span></div>
+      <p class="desc">"模拟器的算法和账本语义可以复用"、<code>workers_per_instance = tp × pp</code> 的警告、<code>base_instances > 1</code>、<code>state_version</code> 单调递增——均与代码一致，警告成立（直接照搬 <code>tp×pp</code> 到 verl 会丢 dp 维度，正是 04 §10.1 警告的内容）。</p>
+      <div class="ev">src/.../models.py:30-31  workers_per_instance = self.tp * self.pp
+group_scheduler/data_class.py:33  base_instances / worker.py:65  state_version
+group_scheduler.py:429-595  assess_range / waterfill / F1 反饥饿</div>
+    </div></li>
+  </ul>
+
+  <h2><span class="n">五</span>建议修正</h2>
+  <ol class="refs">
+    <li><strong>区分两个模拟器实现</strong>。04 §6.4 与 02 凡称"模拟器"处，应明确指向 <code>src/multi_rl_task_scheduler/</code>（骨架，与 callback 接口一致）还是 <code>group_scheduler/</code>（生产）。建议在 02 §1 顶部加一句声明"映射对象对应骨架 <code>src/</code>，生产模拟器接口不同"，避免读者误以为生产代码已具备目标协议。</li>
+    <li><strong>标注目标协议 vs 现状</strong>。02 的 heartbeat / command / step-idle / session fencing 全是目标设计；建议在 02 标题或 §1 注明"本文为目标协议，模拟器尚未实现"，与 09 §6.1 明确标注 TaskRunner 需新增 concurrency group 的写法保持一致。</li>
+    <li><strong>04 §8.2 措辞</strong>。把"TaskRunner 使用 training=1/heartbeat=1/command=1 三个 concurrency groups"改为"改造后 TaskRunner 将划分三个 concurrency groups"，与 §6.1 末尾"建议的新模式"口径统一。</li>
+    <li><strong>04 §1 算法名</strong>。补回 GRPO，与 00 单一事实来源一致："GRPO + on-policy + sync + HYBRID"。</li>
+    <li><strong>命名对齐</strong>。02/04 若要复用生产模拟器账本，将 <code>decision_id</code> 统一为 <code>action_id</code>，或在文档显式声明"对应模拟器 action_id"。</li>
+    <li><strong>lease 概念澄清</strong>。04/02 所述跨任务 worker lease 在模拟器中不存在；若属新增设计，应注明"新增，非复用模拟器现有 leases"。</li>
+    <li><strong>09 可选补强</strong>。§7.3 补一句 <code>max_concurrent_samples = min(replica_count×16, max_required_samples)</code> 的实际上限，使"需改为可更新"的论据更完整。</li>
+  </ol>
+
+  <hr>
+  <footer>
+    核验范围：verl@7aed6b23 全仓 + multi-rl-task-scheduler 双实现。
+    方法：直接读代码逐条比对，证据保留 文件:行号。09 的 12 项与 04 的 18 项均经独立子代理复核。
+  </footer>
+
+</div>

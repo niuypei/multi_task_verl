@@ -279,7 +279,40 @@ max_global_steps
 abort，client 到其他 replica 继续生成。但它意味着抢占可能产生跨版本 trajectory，必须受现有 staleness
 与 rollout-correction 约束，而不能继续使用 strict on-policy 假设。
 
-### 4.3 对多任务调度的含义
+### 4.3 off-policy 数据和算法控制
+
+当前 FullyAsync 默认保留每个 token 实际生成时的 `rollout_log_probs`。Partial resume 会把各版本生成片段的
+token 和 log prob 分段追加，因此跨版本 trajectory 没有被错误标记成单一行为策略。默认 recipe 使用：
+
+```text
+use_rollout_log_probs = true
+bypass_mode = true
+loss_type = ppo_clip
+rollout_is = null
+rollout_rs = null
+```
+
+即 `π_old=π_rollout`，使用 `π_current/π_rollout` ratio 和 PPO clipping；额外 IS/RS 默认未启用。可选
+Rollout Correction 包括 token/sequence TIS、rejection sampling 和 `bypass_mode=false` 的 Decoupled PPO。
+IS 会向 actor loss 添加权重，RS 会修改 `response_mask`，比单纯的版本号更直接地处理策略分布差异。
+
+必须区分硬控制和观测：
+
+| 机制 | 当前是否阻止数据进入训练 |
+|---|---|
+| `max_required_samples` / MQ 上限 | 是，限制继续生产；MQ 满时丢最老元素 |
+| stale trajectory count | 否，仅指标 |
+| `partial_ratio/max_partial_span` | 否，仅指标 |
+| PPO clipping | 会限制 loss ratio，但不拒绝旧 sample |
+| 配置后的 Rollout IS | 会加权梯度 |
+| 配置后的 Rollout RS | 会通过 mask 排除 token/sequence |
+
+v0.8.0 没有 `max_policy_version_gap`、`max_partial_version_span`、version-aware dequeue 或过旧 sample
+drop/regenerate。并且 stale trajectory 使用 `max_global_steps` 判断，V0→V1 partial trajectory 在当前 V1
+消费时可能不计 stale，只计 partial。完整代码基线见 [10](10-verl-separated-async-mode-overview.md#9-陈旧度与-off-policy-控制全景)
+和 [15](15-verl-fully-async-mode4-partial-rollout.md#10-陈旧度与-off-policy-控制逻辑)。
+
+### 4.4 对多任务调度的含义
 
 - 新 replica 不需要匹配一个离散 step；它应加载 Rollouter 当前允许服务的最新 committed version。
 - 正在创建实例期间若 Trainer 发布新版本，manager 可在激活前重载最新版本，而不是为了旧 command 强行
@@ -471,8 +504,10 @@ TaskRunner 不应在每次 heartbeat 中串行 `ray.get()` 所有组件。Rollou
 | 参数更新进行中 | 暂停激活新实例，或让新实例直接加载新版本 |
 | MQ 已空且 active replicas 为 0 | Trainer 将阻塞，必须先恢复最小 ready capacity |
 
-当前 `max_concurrent_samples = initial_replica_count × 16` 只在初始化时计算。动态扩缩后必须改为可更新的
-并发 limiter；否则新增 replica 不会获得足够请求，缩容后又可能保留过高 active task 上限。
+当前 `max_concurrent_samples = len(initial_replicas) × 16`，并被 `min(..., max_required_samples)`
+封顶（`fully_async_rollouter.py:541-542`），只在初始化时计算。动态扩缩后必须改为可更新的
+并发 limiter；否则新增 replica 不会获得足够请求，缩容后又可能保留过高 active task 上限，且
+`max_required_samples` 封顶值也不会随容量变化重新评估。
 
 ## 8. 动态扩容
 

@@ -37,6 +37,10 @@ v0.8.0 已包含 `MooncakeCheckpointEngine`：
 - receiver 使用 `transfer_sync_read()` 拉取数据；
 - checkpoint backend registry 已支持外部 backend module。
 
+原生 Checkpoint Engine 的完整控制面、trainer→checkpoint worker→推理 server 两跳数据流及各使用场景见
+[17-verl-checkpoint-engine-runtime.md](17-verl-checkpoint-engine-runtime.md)。本文只讨论实时扩缩额外需要的
+版本化 DDR store 能力。
+
 但当前代码不能直接满足本方案：
 
 | 当前 Mooncake checkpoint engine | 本方案需要 |
