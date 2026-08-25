@@ -374,7 +374,7 @@ effective_replicas
 - 不根据单一 `inflight==0` 自行决定捐赠；
 - 不执行跨任务 Server 创建。
 
-#### BorrowedRolloutReplica、MultiTaskCheckpointEngineWorker
+#### MultiTaskCheckpointEngineWorker
 
 受赠 replica 不调用原生 `init_standalone()`，否则会再次申请 ResourcePool/PG/GPU，而是使用 donor slot 中的 placement 信息：
 
@@ -384,7 +384,6 @@ donor worker handles/PG provenance
 → hard node affinity
 → explicit CUDA_VISIBLE_DEVICES/local rank
 → borrower Server/backend
-→ donor existing CE Worker binds borrower endpoint
 ```
 
 这里不创建新的受赠 CheckpointEngineWorker。初始化阶段所有可捐赠 replica 都创建
@@ -506,11 +505,12 @@ flowchart TB
 ```
 
 
-简化图
+### 4.2.3 简化图
 
-![[Pasted image 20260824212705.png]]
+![示例图片](./img/as_is.png)
 
-![[Pasted image 20260824212722.png]]
+![示例图片](./img/multi_task.png)
+
 ## 运行视图
 
 ### 心跳、状态上报
