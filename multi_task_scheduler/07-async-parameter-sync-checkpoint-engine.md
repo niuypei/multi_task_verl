@@ -191,10 +191,19 @@ classDiagram
       +checkpoint_engine
       +server_adapter
     }
-    class BorrowedCheckpointEngineWorker {
-      +borrower_checkpoint_engine
-      +borrower_server_adapter
-      +explicit_gpu_binding
+    class MultiTaskCheckpointEngineWorker {
+      +active_endpoint
+      +endpoint_lock
+      +bind_endpoint()
+      +unbind_endpoint()
+      +update_weights()
+    }
+    class BorrowedCheckpointEndpoint {
+      +worker_handle
+      +server_handle
+      +ipc_endpoint
+      +logical_rank
+      +lease_epoch
     }
 
     GroupScheduler o-- TaskRunner : ActorHandle
@@ -203,8 +212,10 @@ classDiagram
     MultiTaskCheckpointEngineManager *-- EffectiveReplica
     MultiTaskLLMServerManager o-- EffectiveReplica
     MultiTaskLLMServerManager --> GlobalRequestLoadBalancer
-    EffectiveReplica o-- CheckpointEngineWorker : native
-    EffectiveReplica o-- BorrowedCheckpointEngineWorker : borrowed
+    MultiTaskCheckpointEngineWorker --|> CheckpointEngineWorker
+    EffectiveReplica o-- MultiTaskCheckpointEngineWorker : existing handles
+    EffectiveReplica *-- BorrowedCheckpointEndpoint : borrowed binding
+    BorrowedCheckpointEndpoint o-- MultiTaskCheckpointEngineWorker : ActorHandle
 ```
 
 这里 `MultiTaskCheckpointEngineManager` 是 Trainer/controller 内的普通对象，不是 Ray Actor。GroupScheduler 不能直接持有
@@ -222,6 +233,7 @@ EffectiveReplica(
     materialization_type="NATIVE" | "BORROWED",
     rollout_replica=...,
     worker_handles=(...),
+    checkpoint_endpoints=(),  # BORROWED 时保存 endpoint descriptors
     server_handles=(...),
     slot_id=None | ...,
     lease_epoch=None | ...,
@@ -235,7 +247,7 @@ EffectiveReplica(
 ```mermaid
 stateDiagram-v2
     [*] --> CREATING
-    CREATING --> PENDING_SYNC: Server 与 borrower CE endpoint 创建成功
+    CREATING --> PENDING_SYNC: Server 创建且 existing CE Workers endpoint bind 成功
     PENDING_SYNC --> SYNCING: 到达任务原生同步点并进入 membership 快照
     SYNCING --> SYNC_READY: 权重安装成功并返回版本 ACK
     SYNCING --> SYNC_FAILED: 任一 rank 安装失败
@@ -290,51 +302,76 @@ membership_lock
 
 GroupScheduler 可以在任意时刻下发扩缩命令，但不能打断已经开始的 CE 同步事务。
 
-## 7. 受赠 Replica 的 CE 接收端
+## 7. 受赠 Replica 的 CE endpoint
 
-### 7.1 不能复用 donor CheckpointEngineWorker
+### 7.1 不创建新的受赠 CE Worker
 
-donor worker 内部已经绑定 donor 的：
+原生 STANDALONE 的 `CheckpointEngineWorker` 不是只凭 node ID/GPU ID 创建的普通 Actor。它由
+`RayWorkerGroup → RayResourcePool → PlacementGroup bundle` 创建，并申请 `1/max_colocate_count` GPU：
 
-```text
-rollout_config
-model_config
-CheckpointEngine backend state
-ServerAdapter → donor inference server
-```
+- `RolloutReplica.init_standalone()`：`verl/workers/rollout/replica.py:189-239`；
+- Worker 的 PG/bundle 调度和 `num_gpus`：`verl/single_controller/ray/base.py:621-680`。
 
-如果 borrower 把 donor worker handles 放入自己的 CE 集合，borrower 权重最终会传给 donor adapter/server，语义错误。
+donor PG 已预留目标 GPU，borrower 再创建自己的 ResourcePool/PG 无法申请到这批 Ray GPU。用 hard NodeAffinity 创建
+`num_gpus=0` Actor、再手工设置可见 GPU，也不能直接复用原生 Worker：`Worker` 初始化依赖 Ray 设置的 rank/device 环境（
+`verl/single_controller/base/worker.py:181-216,231-281`），CE backend 又会在 `prepare()` 中创建 CUDA buffer。因此本方案取消“运行期新建
+borrowed CE Worker”的设计。
 
-因此，slot lease 中的 donor worker handles 只能用于：
+verl 确实有能包装已有 PG handles 的 `SubRayResourcePool`（`verl/single_controller/ray/base.py:163-178,474-480`），且 STANDALONE
+bundle 预留 1 GPU、原生 Worker 只申请 0.5 GPU。但这只证明已有 PG/bundle 在进程内具备复用机制，不提供跨任务 lease、PG ownership、
+donor job 生命周期和任意 bundle 集合语义。第一阶段不把 donor PG/bundle 暴露为 borrower 的 Worker 创建能力。
 
-- 证明 donor PG/worker 仍存活；
-- 查询有序 node ID 和 GPU ID；
-- 保存 PG/bundle provenance；
-- 作为 borrower Server/receiver 的 placement anchor。
+### 7.2 初始化时创建可重绑定的 MultiTaskCheckpointEngineWorker
 
-不能作为 borrower 的权重接收端。
-
-### 7.2 Borrower-owned CE endpoint
-
-受赠 replica 必须创建 borrower 自己的权重接收端：
+所有可能参与共享的 native replicas 在初始化阶段就创建 `MultiTaskCheckpointEngineWorker`：
 
 ```text
-BorrowedCheckpointEngineWorker per rollout rank
-├─ borrower rollout/model config
-├─ borrower checkpoint backend
-├─ explicit node/GPU binding from GS lease
-└─ borrower ServerAdapter → borrower Server
+native init_standalone()
+→ 原任务 private ResourcePool/PG/bundle
+→ MultiTaskCheckpointEngineWorker Ray Actor（仅创建一次）
+→ bind native endpoint
 ```
 
-由于 GPU 已被 donor PG 预留，该 worker 不能再申请一份 Ray GPU resource。建议在子仓中实现：
+它继承 `CheckpointEngineWorker`，复用 CE receive/apply 数据路径，但增加：
 
-- hard `NodeAffinitySchedulingStrategy`；
-- actor 不声明新的 `num_gpus`；
-- 根据 lease 显式设置可见 GPU 和 local rank；
-- actor/server 名称包含 borrower task/session/replica/lease epoch；
-- 由 GS slot CAS 保证同一 HBM slot 不会出现第二个 borrower。
+```text
+active_endpoint = NATIVE | BORROWER | UNBOUND
+bind_endpoint(endpoint, lease_epoch)
+unbind_endpoint(endpoint_id, lease_epoch)
+endpoint_lock
+ownership/lease CAS
+transport reset on handoff
+```
 
-另一种实现是把 CE receiver 接口合入 borrower Server Actor，但这会提高 Server 与 Checkpoint Engine 的耦合，第一版不推荐。
+当前 `RolloutReplica.get_ray_class_with_init_args()` 硬编码 `ray.remote(CheckpointEngineWorker)`（
+`verl/workers/rollout/replica.py:228-239`），因此需要增加通用 class/factory 注入点，让 `MultiTaskLLMServerManager` 在不改变原生
+ResourcePool/PG/bundle 流程的情况下选择扩展 Worker 类。
+
+### 7.3 BorrowedCheckpointEndpoint 是绑定描述，不是 Worker
+
+每个受赠 rank 创建的是普通 descriptor：
+
+```text
+BorrowedCheckpointEndpoint
+├─ existing donor MultiTaskCheckpointEngineWorker ActorHandle
+├─ borrower Server ActorHandle
+├─ explicit IPC endpoint
+├─ borrower logical replica/rank
+├─ task/session/slot/lease epoch
+└─ endpoint state / installed version
+```
+
+borrower CE manager 把 descriptor 中的 existing Worker handles 纳入 `effective_replicas`。原生 manager 本来就从已有 handles 构造临时
+`RayWorkerGroup`，不创建 Actor，也不查询 ResourcePool/PG（`verl/checkpoint_engine/base.py:485-489`）。
+
+不能直接零修改复用 donor Worker，因为当前 Worker 只有一个 `server_adapter`，`update_weights()` 固定调用它（
+`verl/checkpoint_engine/base.py:299-325`）；vLLM adapter 还根据 Worker 自身 rank、Ray job ID 和 actor name 推导 Server/ZMQ 路径（
+`verl/workers/rollout/vllm_rollout/vllm_rollout.py:77-108,119-153`）。扩展 Worker 必须接受显式 ServerHandle/IPC endpoint，并在 bind/unbind
+时校验 lease、串行化同步和 ownership 切换。
+
+endpoint 所属任务变化时还必须清理旧 CE transport。尤其 NCCL 只有 `rebuild_group=true` 才会在 finalize 销毁旧 group；否则 donor
+trainer 的 group 不能安全复用于 borrower trainer。第一阶段必须强制 handoff reset，并限制同一物理 Worker 任一时刻只属于一个任务的
+effective topology。
 
 ## 8. 捐赠流程
 
@@ -346,7 +383,8 @@ sequenceDiagram
     participant AT as A TaskRunner
     participant ACE as A MultiTaskCheckpointEngineManager
     participant ALB as A LoadBalancer
-    participant AR as A-r3 Server/CE workers
+    participant CW as MultiTaskCheckpointEngineWorker
+    participant AR as vLLMReplica
 
     GS->>AT: DONATE(A-r3, decision_epoch)
     AT->>ALB: remove A-r3 and drain
@@ -355,6 +393,8 @@ sequenceDiagram
     ACE->>ACE: acquire membership_lock
     Note over ACE: 若同步进行中则等待，不中断同步
     ACE->>ACE: remove from effective_replicas<br/>commit membership_epoch
+    ACE->>CW: unbind native endpoint<br/>finalize/reset transport
+    CW-->>ACE: UNBOUND(lease epoch)
     ACE-->>AT: excluded
     AT->>AR: level-2 sleep and verify free HBM
     AR-->>AT: ordered node/GPU placement + free HBM
@@ -374,7 +414,7 @@ donor LB 摘流
 
 借出期间：
 
-- A-r3 的 ResourcePool、PG、bundles、CheckpointEngineWorker actors 继续存活；
+- A-r3 的 ResourcePool、PG、bundles、`MultiTaskCheckpointEngineWorker` actors 继续存活；
 - A-r3 不在 A-LB；
 - A-r3 不在 A-CE `effective_replicas`；
 - A 的后续原生参数同步只更新剩余有效 replicas；
@@ -389,24 +429,31 @@ sequenceDiagram
     participant GS as GroupScheduler
     participant BT as B TaskRunner
     participant BM as B MultiTaskLLMServerManager
-    participant BR as B-r7 Server + borrower CE workers
+    participant BR as BorrowedRolloutReplica
+    participant BEP as BorrowedCheckpointEndpoint
+    participant CW as MultiTaskCheckpointEngineWorker
     participant BCE as B MultiTaskCheckpointEngineManager
     participant BLB as B LoadBalancer
 
     GS->>BT: ASSIGN(slot lease, B-r7)
     BT->>BM: create_borrowed_replica(slot)
     BM->>BR: create Server/backend hidden
-    BM->>BR: create borrower-owned CE endpoints
-    BR-->>BM: descriptor with worker/server handles
+    BM->>BEP: construct existing Worker handle<br/>+ borrower Server/IPC binding
+    BM->>BR: attach endpoint descriptors
+    BR-->>BM: descriptor with existing worker/server handles
     BM-->>BT: B-r7 created, not routable
     BT->>BCE: add_effective_replica(B-r7 descriptor)
+    BCE->>CW: bind_endpoint(BEP, lease epoch)
+    CW->>CW: CAS UNBOUND -> BORROWER<br/>reset/rebuild-ready transport
+    CW-->>BCE: bound
     BCE->>BCE: state=PENDING_SYNC<br/>commit membership_epoch
     BCE-->>BT: registered
     BT-->>GS: assignment materialized, waiting native sync
     Note over BCE,BLB: 此时不触发 update_weights，也不加入 LB
 ```
 
-新 replica 只有在 B 的下一次 verl 原生参数同步中安装成功，才从 `PENDING_SYNC` 变为 `SYNC_READY` 并加入 B-LB。
+这里不创建新的 CE Actor。新 replica 只有在 B 的下一次 verl 原生参数同步中，通过已经绑定 borrower endpoint 的 donor Worker handles
+安装成功，才从 `PENDING_SYNC` 变为 `SYNC_READY` 并加入 B-LB。
 
 ## 10. 原生同步点上的统一同步
 
@@ -441,24 +488,21 @@ sequenceDiagram
     participant T as Trainer/Controller
     participant CE as MultiTaskCheckpointEngineManager
     participant LB as Task LoadBalancer
-    participant NW as Native CE workers
-    participant BW as Borrowed CE workers
-    participant S as Native + Borrowed Servers
+    participant CW as MultiTaskCheckpointEngineWorker
+    participant S as vLLMHttpServer
 
     T->>CE: update_weights(Vnext) at native sync point
     CE->>CE: acquire membership_lock
     CE->>CE: snapshot effective_replicas<br/>membership_epoch=M
     CE->>LB: fence all ACTIVE members
     CE->>S: abort requests and release KV cache
-    CE->>NW: prepare receive topology
-    CE->>BW: prepare receive topology
+    CE->>CW: prepare topology from snapshot Worker handles
     CE->>T: prepare trainer sender
     par 同一次 Checkpoint Engine topology
-        T->>NW: send/apply Vnext
-        T->>BW: send/apply Vnext
+        T->>CW: send Vnext
+        CW->>S: apply via active native/borrower endpoint
     end
-    NW-->>CE: installed Vnext ACK
-    BW-->>CE: installed Vnext ACK
+    CW-->>CE: installed Vnext ACK<br/>endpoint id + lease epoch
     CE->>CE: verify all snapshot members
     CE->>S: resume KV/generation
     CE->>LB: ACTIVE members READY(Vnext)<br/>add successful PENDING_SYNC members
@@ -466,7 +510,8 @@ sequenceDiagram
     CE-->>T: sync complete
 ```
 
-关键点是 native 和 borrowed workers 进入同一个 CE topology，而不是额外创建一套由 GroupScheduler 触发的同步流程。
+关键点是 native 和 borrowed effective replicas 都提供 `MultiTaskCheckpointEngineWorker` handles 并进入同一个 CE topology。区别只在
+Worker 的 active endpoint 指向 native 还是 borrower Server，不会额外创建一套由 GroupScheduler 触发的同步流程。
 
 ### 10.3 建议的扩展骨架
 
@@ -481,13 +526,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
     async def add_effective_replica(self, replica):
         async with self._membership_lock:
+            await self._bind_checkpoint_endpoints(replica)
             self._effective_replicas[replica.replica_id] = replica
             replica.sync_state = "PENDING_SYNC"
             self._membership_epoch += 1
 
-    async def remove_effective_replica(self, replica_id):
+    async def remove_effective_replica(self, replica_id, lease_epoch):
         async with self._membership_lock:
             replica = self._effective_replicas.pop(replica_id)
+            await self._unbind_and_reset_checkpoint_endpoints(replica, lease_epoch)
             replica.sync_state = "SYNC_EXCLUDED"
             self._membership_epoch += 1
 
@@ -500,7 +547,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             await self._verify_and_commit(snapshot, global_steps)
 ```
 
-这是接口语义示意，不是最终实现。实际实现还要处理 `auto_await`、失败时恢复、逐 replica ACK 和 FullyAsync 跨 Actor 回调。
+这是接口语义示意，不是最终实现。实际实现还要处理 native/borrowed endpoint 差异、部分 bind 回滚、`auto_await`、失败时恢复、逐
+replica ACK 和 FullyAsync 跨 Actor 回调。
 
 ## 11. FullyAsync 的特殊边界
 
@@ -514,8 +562,8 @@ FullyAsync 中：
 因此 GS 的 ASSIGN 流程必须经 TaskRunner 同时完成两件事：
 
 ```text
-1. Rollouter 创建 borrower Server/CE endpoints，返回 EffectiveReplica descriptor
-2. Trainer Actor 把 descriptor 加入 MultiTaskCheckpointEngineManager
+1. Rollouter 创建 borrower Server 和 `BorrowedCheckpointEndpoint` descriptors，引用 donor 已有 Worker handles
+2. Trainer Actor 让既有 Workers bind borrower endpoints，并把 descriptor 加入 MultiTaskCheckpointEngineManager
 ```
 
 不能只执行：
@@ -545,8 +593,9 @@ borrower 释放 B-r7：
 ```text
 B-LB remove + drain
 → B-CE remove_effective_replica(B-r7)
-→ 销毁 B-r7 borrower CE endpoints 和 Server
-→ B TaskRunner 向 GS 释放 lease
+→ unbind borrower endpoints and reset CE transport
+→ 销毁 B-r7 Server/backend（不销毁 donor Worker）
+→ B TaskRunner ACK GS: endpoint UNBOUND，slot remains RECLAIMING
 ```
 
 donor A 收回 slot 后，A-r3 仍不能直接 wake 并加入 A-LB，因为借出期间它被排除在 A 的参数同步之外。
@@ -555,6 +604,8 @@ donor A 收回 slot 后，A-r3 仍不能直接 wake 并加入 A-LB，因为借�
 
 ```text
 A-r3 保持不可路由
+→ GS commits RETURNING_TO_DONOR，禁止再次 ASSIGN
+→ A TaskRunner/CE bind A-r3 native endpoint(new lease epoch)
 → A-CE restore_effective_replica(A-r3)，状态=PENDING_SYNC
 → 等 A 下一次原生参数同步
 → A-r3 与其他 A replicas 一起安装 Vnext
@@ -564,6 +615,9 @@ A-r3 保持不可路由
 
 这同样不要求 GroupScheduler 触发参数同步。GS 只把 slot 使用权归还给 A；A-r3 何时重新可服务，由 A 的下一次原生 CE
 同步决定。
+
+若 slot 不立即还给 A，而是继续供其他 borrower 使用，则只有在 Worker 已确认 `UNBOUND` 后 GS 才能发布 `AVAILABLE`，并为下一次
+ASSIGN 生成新 lease epoch。
 
 ## 13. 无历史快照时的生效边界
 
@@ -632,7 +686,7 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 
 ### 15.2 同步中单 replica 失败
 
-如果 native 或 borrowed 任一 receiver 失败：
+如果 native Worker 或 borrowed endpoint 任一 receive/apply 失败：
 
 ```text
 不提交 Vnext
@@ -645,7 +699,7 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 
 ### 15.3 Membership 命令失败
 
-- add 失败：受赠 Server 保持 hidden，清理 borrower 进程并释放 lease；
+- add/bind 失败：受赠 Server 保持 hidden，回滚已切换 endpoint，清理 borrower Server/backend 并释放 lease；
 - donor exclude 失败：禁止 sleep 和发布 slot；
 - remove 失败：先保持 LB 摘流，不释放 slot；
 - 迟到命令：通过 task session、lease epoch、membership epoch 拒绝；
@@ -656,9 +710,10 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 | 组件 | 当前行为 | 目标扩展 |
 |---|---|---|
 | `CheckpointEngineManager` | 固定 list；add/remove 无锁 | `MultiTaskCheckpointEngineManager`、effective map、epoch、lock、snapshot |
-| `CheckpointEngineWorker` | 绑定初始化任务的 adapter/server | 保持固有 replica 使用；不跨任务复用 |
-| borrower receiver | 不存在 | borrower-owned CE worker，显式 node/GPU binding |
-| `MultiTaskLLMServerManager` | 管理本任务 Server | 创建/销毁 borrowed replica，返回 descriptor |
+| `CheckpointEngineWorker` | 单 `server_adapter`，创建类在 `RolloutReplica` 中硬编码 | `MultiTaskCheckpointEngineWorker`：初始化时创建，支持 lease 化 bind/unbind、显式 Server/IPC 和 transport reset |
+| `BorrowedCheckpointEndpoint` | 不存在 | 普通 descriptor，引用 existing Worker ActorHandle，不创建 Ray Actor、不申请 GPU |
+| `RolloutReplica` Worker 创建 | 硬编码 `ray.remote(CheckpointEngineWorker)` | 增加 class/factory 注入点，不改变 native ResourcePool/PG/bundle 流程 |
+| `MultiTaskLLMServerManager` | 管理本任务 Server | 创建/销毁 borrowed Server/backend，构造 endpoint descriptors |
 | One-Step Trainer | 支持 manager class injection | 配置使用子仓 manager |
 | FullyAsync Trainer | 硬编码原生 manager | 子类覆盖或新增 class injection |
 | TaskRunner | 启动训练任务 | 转发 GS 命令并协调 Rollouter/Trainer membership |
@@ -672,16 +727,19 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 3. donor 借出期间的原生参数同步不会唤醒或写入 sleeping donor replica；
 4. borrower Server 创建成功但未同步时不出现在 LB active set；
 5. borrower 的下一次原生同步同时覆盖固有和受赠 replicas；
-6. borrower 权重只进入 borrower-owned adapter/server，不调用 donor adapter；
+6. donor existing Worker bind borrower endpoint 后，权重只进入 borrower Server；旧 donor adapter/IPC 不被调用；
 7. 受赠 replica 在同步成功后才加入 LB；
 8. GS 命令不会直接调用 `_fit_update_weights()`；
 9. add 在 membership snapshot 后到达时等待下一次原生同步；
 10. donor 正在同步时，捐赠事务等待同步结束再排除；
 11. NCCL membership 改变后按新 world size 重建 group；
-12. 单个 borrower receiver 失败时，committed version 不推进且任何新旧 replica 都不提前接流；
+12. 单个 borrowed endpoint 失败时，committed version 不推进且任何新旧 replica 都不提前接流；
 13. borrower 释放后从 borrower CE/LB 同时消失；
 14. donor 收回后先进入 `PENDING_SYNC`，下一次 donor 原生同步完成后才回 LB；
-15. FullyAsync 中 Rollouter membership 改变会显式传播到 Trainer CE，而不是依赖序列化副本自动变化。
+15. FullyAsync 中 Rollouter membership 改变会显式传播到 Trainer CE，而不是依赖序列化副本自动变化；
+16. ASSIGN/RECLAIM 前后 Ray 中 `MultiTaskCheckpointEngineWorker` Actor ID 和数量不变，没有新 PG/bundle；
+17. borrower Trainer 能通过跨任务 ActorHandle 调用 existing Worker，显式 ServerHandle/IPC 不依赖 donor Ray job namespace；
+18. 旧 lease epoch 的 bind/unbind/update RPC 会被 Worker 拒绝，donor/borrower 同步不能同时使用同一物理 Worker。
 
 ## 18. 待评审结论
 
@@ -691,10 +749,11 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 2. `effective_replicas = 未借出的固有 replicas + 当前受赠 replicas`；
 3. GroupScheduler 只经 TaskRunner 调整 CE membership，不触发参数同步；
 4. add/remove 与 `update_weights()` 使用同一 membership lock；
-5. 受赠 replica 必须具有 borrower-owned CE endpoint；
-6. donor worker handle 只作 placement anchor，不能成为 borrower 权重接收端；
+5. 受赠 replica 使用 `BorrowedCheckpointEndpoint` 描述 borrower Server/IPC 与 lease；该对象不是 Worker；
+6. donor `MultiTaskCheckpointEngineWorker` ActorHandle 既是 placement anchor，也是借用期间的物理权重接收端，但必须先从 donor
+   membership 排除并按 lease 原子重绑定；
 7. 新增和归还 replica 都在各自任务下一次 verl 原生同步后进入 LB；
-8. STANDALONE 下 native 和 borrowed endpoints 进入同一个 CE topology；
+8. STANDALONE 下 native 和 borrowed effective replicas 的 existing Worker handles 进入同一个 CE topology；
 9. 动态 NCCL topology 第一版启用 `rebuild_group=true`；
 10. 不使用历史快照时，不承诺受赠 replica 创建后立即接流。
 
@@ -705,8 +764,10 @@ NIXL 每次同步都会按当前 world size 构建 topology 并在 finalize 清�
 ## 19. 代码索引
 
 - STANDALONE replica/CE worker 创建：`verl/workers/rollout/replica.py:189-239`；
+- Worker PG/bundle 调度、SubRayResourcePool 和 existing-handle WG：`verl/single_controller/ray/base.py:163-178,474-480,621-680`；
 - LLMServerManager replica/LB 初始化：`verl/workers/rollout/llm_server.py:266-363`；
 - `CheckpointEngineWorker`：`verl/checkpoint_engine/base.py:278-340`；
+- vLLM ServerAdapter 的 rank/job/IPC 绑定：`verl/workers/rollout/vllm_rollout/vllm_rollout.py:77-108,119-153`；
 - `CheckpointEngineManager`：`verl/checkpoint_engine/base.py:345-515`；
 - CEM add/remove：`verl/checkpoint_engine/base.py:414-429`；
 - CEM update 和 worker handles 聚合：`verl/checkpoint_engine/base.py:470-515`；

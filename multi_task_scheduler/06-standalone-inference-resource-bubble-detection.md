@@ -20,8 +20,8 @@
 1. `GlobalRequestLoadBalancer.inflight == 0` 只能证明 **瞬时无请求**，不能单独证明空泡；
 2. FullyAsync 的结构性空泡来自有限 freshness/staleness budget：预算耗尽后 admission 关闭，当前窗口变为有限工作集合；
    没有这个上限或其他背压，Rollouter 会持续提交 sample，不会形成确定性的结构性空泡；
-3. admission 关闭后，还要等当前窗口所有可能的新 generation 完成首次路由；随后各 replica 才随自己的
-   in-flight 归零而 **逐步** 进入空泡，不要求全局 `active_tasks==0`；
+3. admission 关闭后，还要等当前窗口所有 generation 完成首次路由，并排除 partial retry、multi-turn 下一轮及其他潜在
+   future acquire；随后各 replica 才随自己的 in-flight 归零而 **逐步** 进入空泡，不要求全局 `active_tasks==0`；
 4. `active_tasks==0 && total_inflight==0` 只表示所有 rollout replicas 都已空闲，是全局空泡的最终状态，不是
    单 replica 空泡的定义；
 5. Mode 4 的 `partial_rollout` 不制造空泡；它只允许同步时中断并续跑。abort 后 `inflight==0`、但 partial request
@@ -223,11 +223,18 @@ zero_inflight(r)
 
 window_input_exhausted(w)
 = w.admission_closed
-  && w.observed_first_acquires == w.expected_trajectories
+  && w.claimed_not_spawned == 0
+  && w.first_acquire_pending == 0
+
+no_waiting_inference(w)
+= window_input_exhausted(w)
+  && w.partial_retry_pending == 0
+  && w.next_turn_pending == 0
+  && w.future_turn_sources == 0
 
 natural_bubble(r, w)
 = zero_inflight(r)
-  && window_input_exhausted(w)
+  && no_waiting_inference(w)
   && no_future_acquire(r, w)
   && not maintenance_or_resume_pending(r)
 ```
@@ -245,7 +252,163 @@ predicted_required_concurrency <= capacity_without(r)
 它允许在 admission 仍开放时主动摘掉一个暂时为零的 replica，但会改变 donor 可用容量。本文不把这种状态计入 rollout
 资源空泡；若后续支持，应单独命名为 `PREDICTIVE_RECLAIM_CANDIDATE`。
 
-### 4.3 是否值得借用
+### 4.3 当前窗口“没有待推理样本”的公式
+
+必须先按 `task_session_id + rollout_epoch` 把当前有限工作窗口 `w` 与 dataloader 为下一窗口预取的数据分开。定义：
+
+```text
+C_w = claimed_not_spawned
+    = processor 已从 pending_queue 取出、尚未登记 trajectory 的首轮 generation unit 数
+
+U_w = first_acquire_pending
+    = 当前窗口已登记、但当前 generation 尚未首次调用 LB.acquire 的 trajectory 数
+
+R_w = partial_retry_pending
+    = abort 后等待续推、尚未重新 acquire 的 generation 数
+
+N_w = next_turn_pending
+    = multi-turn 已确定存在下一轮、尚未 acquire 的 generation 数
+
+F_w = future_turn_sources
+    = 尚未 terminal、当前或后续结果仍可能产生下一轮 acquire 的 multi-turn trajectory 数
+
+Q_w = pending_inference = C_w + U_w + R_w + N_w + F_w
+
+I_r = sum(endpoint.inflight for endpoint in replica r)
+I_all = sum(I_r for r in task.replicas)
+```
+
+任务级状态为：
+
+```text
+NO_WAITING_INFERENCE(w) = WINDOW_CLOSED(w) && Q_w == 0
+
+TASK_CLOSED_DRAIN(w) = NO_WAITING_INFERENCE(w) && I_all > 0
+
+TASK_LONG_TAIL(w)
+= TASK_CLOSED_DRAIN(w)
+
+TASK_INFERENCE_IDLE(w) = NO_WAITING_INFERENCE(w) && I_all == 0
+```
+
+其中 `WINDOW_CLOSED` 还隐含“原生 Rollouter 的 pause 当前仍有效”。`_monitor_loop()` 在 MQ 水位下降或 staleness 条件解除后可以
+设置 `paused=false` 并 `_resume_event.set()`（`fully_async_rollouter.py:1060-1099`）；一旦发生 resume，旧 epoch 的
+`WINDOW_CLOSED/TASK_LONG_TAIL` 必须立刻失效，不能跨 epoch 复用。
+
+`Q_w==0` 的含义是当前窗口的工作已经全部跨过 LB acquire 边界，不再有“在 Rollouter/AgentLoop 中等待、尚未交给推理实例”的
+工作；`I_all>0` 表示仍有有限的已发送请求没有完成。本文按调度语义把这个封闭 drain 直接称为任务长尾：剩余工作只减不增。
+刚进入长尾时可以尚无空闲 replica；请求完成时间出现差异后，`I_r` 归零的 replica 才逐个形成可利用尾部空泡。
+
+这里不能使用 `pending_queue.qsize()==0` 代替 `Q_w==0`：`_feed_samples()` 独立预取数据，队列里可以有下一 epoch 的 sample；反过来，
+processor 在 `pending_queue.get()` 后、创建 `active_task` 前还可能因并发上限等待，队列已经减少但 sample 尚未发给 AgentLoop。代码见
+`verl/experimental/fully_async_policy/fully_async_rollouter.py:814-846,894-931`。同样，`active_tasks` 是 sample coroutine 集合，
+而不是推理请求数：sample 在 AgentLoopWorker 中可以展开为多个 trajectory，见
+`verl/experimental/agent_loop/agent_loop.py:473-560`。`prepare_single_generation_data()` 已按 `rollout.n` repeat，首轮
+generation unit 数可以在 sample claim 时用 `len(full_batch)` 登记，见
+`verl/experimental/fully_async_policy/detach_utils.py:42-71`。
+
+原生 verl 没有 `C_w/U_w/R_w/N_w/F_w` 这些按 epoch 关联的计数器，必须在子仓扩展中新增 `RolloutWorkTracker`：
+
+```python
+def close_window(tracker, epoch):
+    if not tracker.native_admission_paused(epoch):
+        return "NOT_CLOSED"
+    tracker.cas_state(epoch, "OPEN", "CLOSING")
+    # 排空 processor 的 sample-claim 临界区，防止冻结集合后还有 trajectory 出现。
+    tracker.wait_until(lambda x: x.claimed_not_spawned == 0)
+    if not tracker.native_admission_paused(epoch):
+        tracker.invalidate(epoch)
+        return "REOPENED"
+    tracker.freeze_accepted_trajectories(epoch)
+    tracker.cas_state(epoch, "CLOSING", "CLOSED")
+    return "CLOSED"
+
+
+def on_native_resume(tracker, old_epoch):
+    tracker.invalidate(old_epoch)
+    tracker.open_next_epoch()
+
+
+def pending_inference(s):
+    return (
+        s.claimed_not_spawned
+        + s.first_acquire_pending
+        + s.partial_retry_pending
+        + s.next_turn_pending
+        + s.future_turn_sources
+    )
+
+
+def classify_task(s):
+    if s.admission_state != "CLOSED":
+        return "OPEN_OR_CLOSING"
+    if pending_inference(s) != 0:
+        return "DISPATCHING"
+    if s.total_inflight == 0:
+        return "TASK_INFERENCE_IDLE"
+    return "TASK_LONG_TAIL"
+
+
+def classify_replica(r, s):
+    if r.inflight != 0:
+        return "BUSY"
+    if s.admission_state != "CLOSED":
+        return "ZERO_INFLIGHT_ONLY"
+    if pending_inference(s) != 0:
+        return "UNISSUED_WORK_EXISTS"
+    if s.maintenance_or_resume_pending(r.id):
+        return "MAINTENANCE_QUIESCED"
+    if s.future_acquire_may_target(r.id):
+        return "FUTURE_ACQUIRE_PENDING"
+    return "NATURAL_BUBBLE"
+```
+
+`RolloutWorkTracker` 是 GS 内部普通状态，不是额外 Actor/通信组件。TaskRunner 心跳提供窗口/accepted 状态，LB 直接提供
+acquire/release 事实；GS 按 generation key 汇合。sample claim 增加 `C_w`；trajectory 登记减少 `C_w`、增加 `U_w`；首次 LB
+acquire 减少 `U_w`、增加 `I_r`；release 减少 `I_r`；可续推 abort 增加 `R_w`；multi-turn 非 terminal 时登记 `F_w`，确定下一轮
+后转成 `N_w`。每个事件都要携带 `trajectory_id + turn_id + attempt_id` 并幂等去重。两个事件源的 watermark 未对齐时必须保守返回
+`DISPATCHING`。
+
+现有 `LLMServerClient` 无法直接生成这些完整事件：`release_server()` 只传 `server_id`，并且在 `finally` 中 fire-and-forget，见
+`verl/workers/rollout/llm_server.py:93-99,170-220`。它既不携带 work key，也不区分 terminal、partial retry 和 multi-turn
+中间结果。目标 LB API 至少需要：
+
+```text
+acquire_server(work_key, routing_epoch)
+release_server(work_key, server_id,
+               TERMINAL | PARTIAL_RETRY_PENDING | TURN_RESULT_PENDING)
+resolve_turn(work_key, TRAJECTORY_TERMINAL | NEXT_TURN_READY)
+```
+
+前两个操作在 MultiTask LB Actor 内原子更新 generation 状态、replica inflight 和 `lb_event_seq`；`resolve_turn` 用于精确跟踪
+multi-turn。若第一阶段不扩展 AgentLoop 的逐 turn 生命周期，则采用安全降级：只对 single-turn 做逐 replica 自然空泡判断；
+multi-turn 必须等相关 `active_tasks==0`，或先将候选 replica 原子切到 DRAINING，才能把 `F_w` 清零。这样虽然损失一部分可共享
+时间，但不会把工具调用期间的 zero-inflight 当成可捐赠空泡。
+
+对于 single-turn 且 `partial_rollout=false`，`Q_w==0` 后不会再产生新 generation，因此可直接进入 drain/长尾判断。multi-turn
+trajectory 的当前 generation 完成后可能再次调用
+`LLMServerClient.generate()`（`verl/experimental/agent_loop/tool_agent_loop.py:208-240`），所以还要确保 trajectory terminal，或者
+把候选 replica 路由 fence；Mode 4 则必须把 partial client 在 abort 后的重试计入 `R_w`，代码见
+`verl/experimental/fully_async_policy/fully_async_rollouter.py:98-145`。
+
+### 4.4 长尾形成例子
+
+假设窗口 `w=42` 有 16 条 single-turn trajectory、4 个 replica，且 `partial_rollout=false`：
+
+| 时刻 | `C/U/R/N/F` | `I_R0/I_R1/I_R2/I_R3` | completed | 状态 |
+|---|---:|---:|---:|---|
+| `t0`：16 条全部 acquire | `0/0/0/0/0` | `4/4/4/4` | 0 | 工作全部发出，任务进入 `TASK_LONG_TAIL`，但尚无 replica 空泡 |
+| `t1`：短请求先结束 | `0/0/0/0/0` | `0/1/2/3` | 10 | 任务处于 `TASK_LONG_TAIL`，R0 形成自然空泡 |
+| `t2` | `0/0/0/0/0` | `0/0/1/2` | 13 | R0、R1 均为空泡，剩余请求集中在 R2/R3 |
+| `t3` | `0/0/0/0/0` | `0/0/0/0` | 16 | 整个任务窗口 `TASK_INFERENCE_IDLE` |
+
+从 `t0` 起之所以能断言任务进入长尾，不是因为某个 replica 的计数碰巧为零，而是因为窗口已经关闭、accepted 集合已冻结、
+所有 16 条 trajectory 都完成首次 acquire、没有 retry/下一轮/潜在 future-turn 请求，故剩余工作只会减少，不会补入新工作。到 `t1` 时剩余
+6 条请求集中在 R1/R2/R3，R0 才形成第一个可利用尾部空泡。若 `pending_queue` 中还有
+feed coroutine 预取的下一窗口 sample，它们不属于 `w=42`；直到下一次 admission epoch 打开才有资格进入推理侧。若场景是
+multi-turn 且仍有下一轮可能，R0 只能是 `ZERO_INFLIGHT_ONLY`，不能据此共享。
+
+### 4.5 是否值得借用
 
 真正执行跨任务借用前还需满足：
 
@@ -308,8 +471,16 @@ BATCH_INPUT_EXHAUSTED
 = 当前 generation 的所有 expected trajectory_id
   都至少完成过一次 LB acquire
 
+ONE_STEP_TASK_LONG_TAIL
+= batch_expected_set_frozen
+  && BATCH_INPUT_EXHAUSTED
+  && no_partial_or_future_turn_acquire
+  && total_inflight > 0
+  && weight_sync_state == IDLE
+
 ONE_STEP_REPLICA_IDLE(r)
-= generation.agent_capability == SINGLE_GENERATE
+= ONE_STEP_TASK_LONG_TAIL
+  && generation.agent_capability == SINGLE_GENERATE
   && generation.input_exhausted
   && r.inflight == 0
 ```
@@ -355,7 +526,8 @@ input_exhausted = true
 R0/R1/R2 inflight = 2/1/0
 ```
 
-R2 形成自然空泡。若预计 R0 的长尾还需 40 秒，而完整共享事务成本为 12 秒，GS 可以摘流并复用 R2；若长尾只剩
+此时 `total_inflight=3>0`，所以 B7 已进入任务长尾；R2 同时形成自然空泡。若预计 R0 的长尾还需 40 秒，而完整共享事务成本为
+12 秒，GS 可以摘流并复用 R2；若长尾只剩
 3 秒，则只记录空闲指标，不执行 sleep/create。
 
 ## 6. FullyAsync Mode 1：On-Policy Pipeline
@@ -383,13 +555,18 @@ MODE1_WINDOW_CLOSED
   && pause_reason in {FRESHNESS_LIMIT, MQ_FULL}
   && (staleness_samples >= max_required_samples
       || mq_queue_size >= max_queue_size)
+  && accepted_generation_set_frozen
+
+MODE1_TASK_LONG_TAIL
+= MODE1_WINDOW_CLOSED
+  && PENDING_INFERENCE == 0
+  && total_inflight > 0
+  && weight_sync_state == IDLE
 
 MODE1_REPLICA_BUBBLE(r)
-= MODE1_WINDOW_CLOSED
-  && WINDOW_INPUT_EXHAUSTED
+= MODE1_TASK_LONG_TAIL
   && no_future_acquire(r)
   && r.inflight == 0
-  && weight_sync_state == IDLE
 ```
 
 其中 `WINDOW_INPUT_EXHAUSTED` 不是 `active_tasks==0`，而是窗口内所有 expected trajectories 都完成了首次 LB acquire。
@@ -438,6 +615,9 @@ R0/R1 inflight=0/2
 此时 R0 已进入自然空泡，R1 仍在处理长尾；不需要等待 `active_tasks==0`。等 R1 也归零后，才形成任务级全局空泡。
 Trainer 是否已经取满 4 个 sample 影响空泡预计持续多久和是否值得借用，但不改变 R0 的 per-replica 空泡定义。
 
+从 `window_input_exhausted=true && total_inflight=2` 开始，任务已经处于 Mode 1 长尾；`R0=0` 只进一步说明第一个
+per-replica 尾部空泡已经出现。
+
 Mode 1 的窗口通常只有一次 actor update 的时长，可能短于创建 borrower 的成本，所以它虽然最容易出现明确 barrier，
 未必最容易获得正收益。
 
@@ -457,17 +637,21 @@ Rollouter 用同一发布版本最多提交 `R*T` 个 sample；Trainer 每取 R 
 
 ### 7.2 严格判断
 
-per-replica 自然空泡条件与 Mode 1 相同，只是窗口大小变为 `R*T`：
+任务长尾和 per-replica 自然空泡条件与 Mode 1 相同，只是窗口大小变为 `R*T`：
 
 ```text
-MODE2_REPLICA_BUBBLE(r)
+MODE2_TASK_LONG_TAIL
 = admission_closed(FRESHNESS_LIMIT or MQ_FULL)
   && (staleness_samples >= max_required_samples
       || mq_queue_size >= max_queue_size)
-  && WINDOW_INPUT_EXHAUSTED
+  && PENDING_INFERENCE == 0
+  && total_inflight > 0
+  && weight_sync_state == IDLE
+
+MODE2_REPLICA_BUBBLE(r)
+= MODE2_TASK_LONG_TAIL
   && no_future_acquire(r)
   && r.inflight == 0
-  && weight_sync_state == IDLE
 ```
 
 Mode 2 额外提供了更好的空闲时长估计：
@@ -499,7 +683,8 @@ predicted_required_concurrency
 
 ### 7.4 例子
 
-`R=4,T=4`，Rollouter 已生成 16 个 sample 并 drain；Trainer 刚完成第 2 次本地 update，MQ 中还有 8 个 sample。
+`R=4,T=4`，Rollouter 已将 16 个 sample 全部发出，`PENDING_INFERENCE=0`，3 个 replica 的
+`inflight=0/1/3`，因此任务处于长尾且第一个 replica 已形成空泡。Trainer 刚完成第 2 次本地 update，MQ 中还有 8 个 sample。
 若每次 update 约 20 秒，则推理侧预计还有约 40 秒无需生产。完整共享事务成本 12 秒时，这比 Mode 1 更适合借用。
 
 注意：GS 只能使用 `T` 预测窗口，不能为了制造更长空泡擅自修改 `T`；它会改变 off-policy 语义。
@@ -516,18 +701,23 @@ max_required_samples = int(R * T * (1 + S)), S > 0
 
 Rollouter 可以在基础训练窗口外预生成 stale sample。有限的 staleness budget 是结构性空泡形成的原因：达到
 `max_required_samples`（或同容量 MQ 上限）后 processor 停止接纳新 sample，持续生产流被封闭成有限集合；等窗口内所有
-trajectory 完成首次路由后，各 replica 随请求结束逐步进入空泡。如果没有这个有限预算和 MQ 背压，Rollouter 会持续推送，
-短暂 `inflight==0` 不能算结构性空泡。
+trajectory 完成首次路由后，在 single-generate 或 `no_future_acquire` 已由 terminal/fence 证明的前提下，各 replica 随请求结束
+逐步进入空泡。如果没有这个有限预算和 MQ 背压，Rollouter 会持续推送，短暂 `inflight==0` 不能算结构性空泡。
 
 ### 8.2 严格判断
 
 ```text
-MODE3_REPLICA_BUBBLE(r)
+MODE3_TASK_LONG_TAIL
 = admission_closed(FRESHNESS_LIMIT or MQ_FULL)
-  && WINDOW_INPUT_EXHAUSTED
+  && PENDING_INFERENCE == 0
+  && total_inflight > 0
+  && weight_sync_state == IDLE
+  && quiesce_reason != WEIGHT_SYNC_ABORT
+
+MODE3_REPLICA_BUBBLE(r)
+= MODE3_TASK_LONG_TAIL
   && no_future_acquire(r)
   && r.inflight == 0
-  && weight_sync_state == IDLE
 ```
 
 对 single-generate，`WINDOW_INPUT_EXHAUSTED` 可推出不会再有当前窗口请求；对 multi-turn，仍需 trajectory terminal
@@ -563,8 +753,8 @@ Mode 3 不能为了快速释放 GPU 主动 abort 长请求。当前权重同步�
 
 ### 8.4 例子
 
-`R=4,T=2,S=0.5`，最大预算 12。Rollouter 接纳 S1—S12 后因 staleness 上限关闭 admission。所有 trajectory
-完成首次路由后，R0 先归零，R0 即进入空泡；不需要等待其他 replicas drain。Trainer 已消费 S1—S8、MQ 中有
+`R=4,T=2,S=0.5`，最大预算 12，并假设都是 single-turn trajectory。Rollouter 接纳 S1—S12 后因 staleness 上限关闭 admission。所有 trajectory
+完成首次路由后，假设 `inflight=0/1/3`，则任务已经进入长尾，R0 同时进入空泡；不需要等待其他 replicas drain。Trainer 已消费 S1—S8、MQ 中有
 S9—S12 时，queue 能直接支撑下一次 R=4 的训练 batch，这会延长空泡的可利用时间，但不是空泡成立条件。
 
 权重同步到 V1 后，MQ 中 4 个 V0 sample 使 reset 起点为 4，Rollouter 还可提交 8 个 V1 sample。因此 GS 必须在
@@ -594,6 +784,7 @@ Rollouter 持续接纳并提交 sample
 → processor 暂停接纳新 sample，关闭当前 admission epoch
 → 已接纳但尚未首次路由的 trajectories 继续进入 LB
 → 当前 epoch 的全部 trajectories 完成首次 acquire
+→ single-turn，或已证明没有 partial/next-turn/future-turn acquire
 → 各 replica 随自己的请求完成而逐步进入空泡
 → Trainer 更新/同步后 reset_staleness()
 → admission 重新打开，Rollouter 恢复推送
@@ -630,12 +821,18 @@ MODE4_WINDOW_INPUT_EXHAUSTED
 = admission_closed
   && observed_first_acquire_ids == expected_trajectory_ids
 
-MODE4_REPLICA_NATURAL_BUBBLE(r)
+MODE4_TASK_LONG_TAIL
 = MODE4_WINDOW_INPUT_EXHAUSTED
+  && partial_resume_pending == 0
+  && next_turn_pending == 0
+  && future_turn_sources == 0
+  && total_inflight > 0
+  && weight_sync_state == IDLE
+
+MODE4_REPLICA_NATURAL_BUBBLE(r)
+= MODE4_TASK_LONG_TAIL
   && no_future_acquire(r, current_epoch)
   && r.inflight == 0
-  && weight_sync_state == IDLE
-  && partial_resume_may_target(r) == false
 ```
 
 对于 single-generate trajectory，完成首次 acquire 后不会再请求，所以窗口 input exhausted 后，每个 replica 的最后一个请求
@@ -751,7 +948,7 @@ Checkpoint Engine 的全体 abort 直接等同于单 replica 弹性迁移。
 
 ### 9.5 完整例子
 
-假设 `R=4,T=2,S=0.5`，所以 `max_required_samples=12`。Rollouter 持续接纳 S1—S12；接纳第 12 个
+假设 `R=4,T=2,S=0.5`，所以 `max_required_samples=12`，且 S1—S12 都是 single-turn。Rollouter 持续接纳 S1—S12；接纳第 12 个
 sample 后达到 staleness 上限，关闭 admission。S1—S12 的所有 trajectories 完成首次 acquire 后：
 
 ```text
@@ -760,8 +957,8 @@ partial_resume_pending = 0
 weight_sync_state = IDLE
 ```
 
-R0 已进入自然空泡；R1/R2 仍在处理当前窗口。这个空泡的根因是 staleness budget 已经关闭生产入口，而不是
-`partial_rollout=true`。
+此时 `total_inflight=4>0`，任务已经进入长尾；R0 已进入自然空泡，R1/R2 仍在处理当前窗口。这个空泡的根因是 staleness
+budget 已经关闭生产入口，而不是 `partial_rollout=true`。
 
 随后 Trainer 触发同步。S11 在 R1 上生成 30 tokens 后因同步中断，R1 的 in-flight 归零，但 S11 的 client 正等待 V1，
 `active_tasks=1, partial_resume_pending=1`。R1 的 zero-inflight 是同步导致的
@@ -776,6 +973,7 @@ R0 已进入自然空泡；R1/R2 仍在处理当前窗口。这个空泡的根�
 | 有限工作窗口预算上限 | 完整 batch | `R` | `R*T` | `int(R*T*(1+S))` | `int(R*T*(1+S))` |
 | admission 关闭来源 | batch 集合固定 | freshness 上限 | freshness 上限 | staleness/MQ 上限 | staleness/MQ 上限 |
 | `WINDOW_INPUT_EXHAUSTED` | `BATCH_INPUT_EXHAUSTED` | 必需 | 必需 | 必需 | 必需 |
+| 任务进入长尾 | batch frozen、无待发工作、`total_inflight>0` | window closed、`PENDING_INFERENCE=0`、`total_inflight>0`、sync idle | 同 Mode 1，窗口为 `R*T` | 同 Mode 1，且排除 sync abort | 同 Mode 3，且 partial/next/future pending 全为 0 |
 | `active_tasks==0` | batch terminal 可提供更强证据 | 仅表示全局空泡 | 仅表示全局空泡 | 仅表示全局空泡 | 还需排除 partial pending，仍只表示全局状态 |
 | MQ backlog | 无 | 通常接近 0 | 窗口内可有 | 重要的 coverage 信号 | 重要，但可能混合 partial |
 | Trainer waiting | future 未完成即 rollout 短缺 | 为 true 时不宜缩 | 为 true 时不宜缩 | queue 空时不宜缩 | 同左 |
@@ -863,10 +1061,11 @@ RolloutDemandSnapshot {
   paused
   pause_reason
   admission_epoch
-  admission_closed
-  expected_trajectories
-  observed_first_acquires
-  window_input_exhausted
+  admission_state: OPEN | CLOSING | CLOSED
+  work_snapshot_version
+  accepted_generation_count
+  accepted_generation_digest
+  claimed_not_spawned
   agent_capability
   active_tasks
   pending_queue_size
@@ -874,20 +1073,24 @@ RolloutDemandSnapshot {
   mq_version_histogram
   staleness_samples
   max_required_samples
-  partial_resume_pending
   request_arrival_rate
   token_service_rate
 }
 ```
 
 One-Step 只填写 batch/generation 字段；FullyAsync 填写 queue/window 字段。使用同一个 envelope，GS 可以统一维护任务状态，
-不需要为每种模式新增调度 actor。
+不需要为每种模式新增调度 actor。`observed acquire/release`、partial/next-turn disposition 来自 LB 事件，不要求 TaskRunner 再复制一份；
+GS 内部 tracker 将其与 `accepted_generation_digest/work_snapshot_version` 对齐后，派生 `U_w/R_w/N_w/F_w` 和
+`window_input_exhausted`。
 
 ### 11.3 事件幂等和 fencing
 
 LB 向 GS 上报：
 
 ```text
+GENERATION_ACQUIRED
+GENERATION_RELEASED
+GENERATION_DISPOSITION_RESOLVED
 REPLICA_ZERO_INFLIGHT
 REPLICA_ACTIVE_AGAIN
 REPLICA_DRAIN_COMMITTED
@@ -898,12 +1101,14 @@ REPLICA_WAKE_COMMITTED
 每个事件携带：
 
 ```text
-(task_id, task_session_id, rollout_epoch,
+(task_id, task_session_id, rollout_epoch, work_snapshot_version,
+ trajectory_id, turn_id, attempt_id, disposition,
  replica_id, routing_epoch, server_load_version, event_seq)
 ```
 
 GS 按版本丢弃迟到事件。尤其是 `release_server()` 当前为 fire-and-forget，扩展协议不能用一次轮询结果覆盖更新的 acquire；
-必须在同一个 LB actor 内完成 `expected_version + inflight==0 + ACTIVE` 的 CAS。
+必须在同一个 LB actor 内完成 generation 状态变换和 `expected_version + inflight==0 + ACTIVE` 的 CAS。TaskRunner 快照与 LB
+事件的 generation key/watermark 尚未对齐时，GS 必须保持 `DISPATCHING`，不能发布空泡。
 
 ## 12. 从候选到 HBM 空泡的完整时序
 
@@ -991,6 +1196,10 @@ TaskRunner 的 lifecycle fence 必须覆盖 CEM registry 修改、drain 和 slee
 15. borrower 创建失败时，slot lease 回滚且 donor 能按正确版本恢复；
 16. TaskRunner/LB/GS 任一重启后，旧 session 事件不污染新任务；
 17. 扩缩后 `max_concurrent_samples` 和实际 active replica capacity 一致。
+18. processor 已 `get()`、尚未 spawn task 时，`claimed_not_spawned>0` 阻止空泡误判；
+19. pause barrier 完成后 MQ 水位下降触发 resume，旧 rollout epoch 的 long-tail/bubble 立即失效；
+20. LB acquire/release 事件乱序或 TaskRunner snapshot 落后时，watermark 未对齐且 GS 保守保持 `DISPATCHING`；
+21. multi-turn 没有逐 turn lifecycle hook 时，`active_tasks>0` 或 `future_turn_sources>0` 阻止自然空泡；DRAINING fence 后可安全改路由。
 
 ## 16. 评审要点
 
