@@ -308,10 +308,9 @@ classDiagram
 - 接收 LB 上报的 per-replica inflight/idle/routing 状态；
 - 结合任务需求、空泡预测、优先级和成本生成 DONATE/ASSIGN/PREEMPT/RECLAIM 等决策；
 - 将决策发送给 donor/borrower TaskRunner；
-- 使用本地维护的全局资源视图保证同一 HBM slot 不会被重复分配；
+- 使用本地维护的全局资源视图保证同一卡被有限次重复分配；
 - 不直接调用RL任务的普通对象 manager，通过TaskRunner下发指令执行；
 - 不触发参数同步；
-- 不持有请求 payload、AgentLoop future 、权重等RL任务数据面数据。
 
 #### MultiTaskFullyAsyncTaskRunner
 
@@ -321,7 +320,7 @@ classDiagram
 - 启动时向 GlobalScheduler 注册任务、基础资源和自身 ActorHandle；
 - 持有 Trainer、Rollouter 和 GlobalScheduler handles；
 - 响应 GlobalScheduler 主动 heartbeat probe，并通过 GS handle 上报注册/状态变化/注销、资源需求和同步；
-- donor 侧执行摘流、CheckpointEngine 排除、sleep 和 slot 释放；
+- donor 侧执行摘流、CheckpointEngine 排除、sleep 和 卡释放；
 - borrower 侧执行 Server 创建、donor CheckpointEngine Worker endpoint 重绑定、CheckpointEngine 注册和 GlobalRequestLoadBalancer 激活；
 - 任务结束时注销资源。
 
@@ -335,9 +334,8 @@ classDiagram
 - 管理运行期创建的 borrowed replicas；
 - 对replica执行创建、销毁、sleep、wake、abort等操作；
 - 基于MultiTaskCheckpointEngineWorker查询有序 node/GPU IDs；
-- 不创建新的MultiTaskCheckpointEngineWorker；将已存在的 `MultiTaskCheckpointEngineWorker` 临时关联到borrowed replica；
-- 返回可序列化的 `EffectiveReplica` descriptor 给 TaskRunner；
-- 操作扩展 LB 的路由状态；
+- 不创建新的MultiTaskCheckpointEngineWorker，将已存在的 `MultiTaskCheckpointEngineWorker` 临时关联到borrowed replica；
+- 操作扩展 LB 的路由后端 replica 状态；
 - 不制定跨任务调度策略；
 - 不直接调用位于 Trainer Actor 内的 CE manager。
 
@@ -353,10 +351,9 @@ effective_replicas
 
 职责：
 
-- 使用 stable replica ID 保存有效集合；
-- 使用 membership lock 串行化 add/remove 与 `update_weights()`；
-- 为每次同步生成不可变 membership snapshot 和 epoch；
-- 在 verl 原生同步点统一同步 native 和 borrowed CE endpoints；
+- 维护 replica 有效集合；
+- 使用 lock 串行化 add/remove 与 `update_weights()`；
+- 为每次同步生成不可变 replica snapshot 和 epoch；
 - 同步失败时阻止混合版本 replicas 接流；
 - 不由 GlobalScheduler 直接调用，命令由 TaskRunner/Trainer Actor 转发。
 
