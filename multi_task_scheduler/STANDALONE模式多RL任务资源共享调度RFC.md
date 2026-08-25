@@ -47,7 +47,7 @@ RayResourcePool
 
 1. verl/Ray 原生资源视图：ResourcePool、Placement Group、bundle 和 worker actor；
 2. 推理负载均衡视图：LB 只通过 Server ActorHandle 分发请求；
-3. GlobalScheduler 全局物理视图：node ID、GPU ID、HBM slot 和跨任务 lease。
+3. GlobalScheduler 全局物理视图：node ID、GPU ID、HBM slot 和跨任务租借。
 
 此外，Checkpoint Engine 需要维护当前任务的参数同步执行集合：
 
@@ -365,18 +365,17 @@ effective_replicas
 扩展原生 `GlobalRequestLoadBalancer`：
 
 - 维护 `server_id → ActorHandle`；
-- 维护 per-server in-flight route 数；
-- 维护 sticky logical request routing；
+- 维护 per-server in-flight 请求数；
 - 维护 `READY/DRAINING/SYNCING/SLEEPING` 状态和 routing epoch；
-- 只向 `READY(committed_rollout_version)` Server 路由；
+- 只向 `READY Server` 分发请求；
 - 在 zero-inflight 等状态变化时向 GlobalScheduler 上报事实；
-- 支持两阶段摘流，DRAINING 时拒绝新 acquire 但保留旧 route/inflight；
+- 支持 Server 摘流；
 - 不根据单一 `inflight==0` 自行决定捐赠；
 - 不执行跨任务 Server 创建。
 
 #### MultiTaskCheckpointEngineWorker
 
-受赠 replica 不调用原生 `init_standalone()`，否则会再次申请 ResourcePool/PG/GPU，而是使用 donor slot 中的 placement 信息：
+受赠 replica 不调用原生 `init_standalone()`，否则会再次申请 ResourcePool/PG/GPU，而是使用 donor 节点和卡信息：
 
 ```text
 donor worker handles/PG provenance
@@ -387,8 +386,7 @@ donor worker handles/PG provenance
 ```
 
 这里不创建新的受赠 CheckpointEngineWorker。初始化阶段所有可捐赠 replica 都创建
-`MultiTaskCheckpointEngineWorker`；它继承原生 `CheckpointEngineWorker`，仍是 donor private PG bundle 中已经存在的 Ray Actor。借出时，
-borrower 只得到这些 ActorHandles 的临时使用权。
+`MultiTaskCheckpointEngineWorker`；它继承原生 `CheckpointEngineWorker`，仍是 donor private PG bundle 中已经存在的 Ray Actor。借出时，borrower 只得到这些 MultiTaskCheckpointEngineWorker 的临时使用权。
 
 ## 4.2 部署视图
 
@@ -510,6 +508,12 @@ flowchart TB
 ![示例图片](./img/as_is.png)
 
 ![示例图片](./img/multi_task.png)
+
+## 待讨论点
+
+1. 对verl扩展较多，社区是否接受
+2. verl原生不支持rollout-rollout参数同步路径，当前只能基于train-rollout路径扩展，是否需要跟社区提新的参数同步路径
+3. 可靠性，verl本身支持较弱，子仓需强化
 
 ## 运行视图
 
