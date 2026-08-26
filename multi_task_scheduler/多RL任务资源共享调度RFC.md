@@ -43,7 +43,7 @@ donor 任务感知并向GlobalScheduler上报空泡卡资源
 
 单任务内 VERL 通过 RAY 完成资源占用和绑定，基于资源的Actor创建完成后默认资源是被任务独占的，无法在多任务间进行共享。
 - Ray 资源视图会认为这些 GPU 在任务整个生命周期内始终被该 replica 占有
-- 模型权重和 KV cache HBM，Ray 仍不会把 PG 已预留的 GPU resource 重新分配给其他任务
+- Ray 不会把 PG 已预留的 GPU resource 重新分配给其他任务
 
 解决方案：以单任务基于 Ray resource bundle 创建的 Actor 为锚点，创建推理后端进程。
 
