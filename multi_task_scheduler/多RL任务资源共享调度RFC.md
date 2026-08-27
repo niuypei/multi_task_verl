@@ -21,6 +21,12 @@
 
 ## 2.3 基本思路
 
+多任务资源共享遵循以下原则：
+
+1. 只有当卡资源出现空闲时才能够将其进行共享
+2. 任务基于原生资源创建的进程均不销毁，受赠任务的进程允许
+3. 当 donor 任务需要卡时，通过强行中断推理进行回收
+
 在多个同时运行的 RL 任务之间临时共享 rollout 卡资源基本流程：
 
 ```text
@@ -33,9 +39,26 @@ donor 任务感知并向GlobalScheduler上报空泡卡资源
 → borrower 将租借的 replica 加入自己的参数同步集合和 LB
 ```
 
+
 ## 2.3 用户界面
 
 用户通过新增的`rollout_donation_ratio`参数控制资源共享程度，其中`rollout_donation_ratio`的范围是`[0, 1]`。该参数控制了某个RL任务期望捐出的卡数以及期望受捐的卡数，设置为0时拒绝参与资源共享。例如当rollout共有16张卡，`rollout_donation_ratio = 0.5`，这意味着该任务rollout资源出现空泡时，最多会将8张卡共享给其他任务。同时，当该任务需要加速时，最多会得到其他任务共享的8张卡。综上，该任务在rollout期间的卡数变化范围是`[8, 24]`。
+
+## 2.4 调度流程
+
+1. 任务 X 拉起后向 GlobalScheduler 注册，将本任务期望共享的卡规模以及资源视图上报，GlobalScheduler 将任务 X 允许进行共享的资源纳入全局视图进行管理
+2. 任务 X 启动训练进入 rollout 阶段，当任务 X 的推理资源感知到空泡（同步模式下：该 step 内样本已经全部消耗完毕，出现空闲推理实例；异步模式下：受陈旧度等控制，进入等待长尾请求完成阶段，出现空闲实例），任务 X 执行一下操作：
+	- 将空闲推理实例从 GlobalRequestLoadBalancer移除
+	- 将闲推理实例从 CheckpointEngineManager、CheckpointEngineManagerWorker、LLMServerManager 等组件中的活跃server列表中移除，加入 inactive server 列表
+	- 将空闲推理实例进行休眠，卸载其权重及 KV Cache
+	- 向 GlobalScheduler 上报空泡卡资源
+3. GlobalScheduler 根据空卡资源规模及当前全局任务忙闲程度，确定受捐任务集合 S 及各个任务的卡分配策略
+4. GlobalScheduler 向受捐任务下发创建推理实例指令，受捐任务基于NODE ID、GPU ID信息通过 NodeAffinity 创建推理实例
+5. 推理实例创建完成后，GlobalScheduler 向受捐任务下发指令，将新创建的推理实例加入CheckpointEngineManager、CheckpointEngineManagerWorker、LLMServerManager 等组件中的活跃server列表
+6. 当任务 X 重新需要推理实例时（同步模式：重新进入 rollout 阶段；异步模式：长尾请求等待结束，继续异步rollout），该任务向 GlobalScheduler 上报卡缺口（当前卡规模和基线卡规模的差值）
+7. GlobalScheduler 基于资源视图生成回收策略（回收任务 X 捐赠的卡），分别向相关的受捐任务下发回收指令
+8. 受捐任务中断回收实例，销毁或休眠推理实例，将其从GlobalRequestLoadBalancer、CheckpointEngineManager、CheckpointEngineManagerWorker、LLMServerManager 等组件中移除
+9. GlobalScheduler 向任务 X 下发指令，将回收实例唤醒，完成参数同步，恢复GlobalRequestLoadBalancer、CheckpointEngineManager、CheckpointEngineManagerWorker、LLMServerManager 等组件对推理实例的索引
 
 # 3. 多任务资源共享下 VERL 的架构 GAP
 
@@ -555,10 +578,9 @@ classDiagram
       <<PlainObjectProxy>>
       worker_handles
     }
-    class DetachActorWorker {
+    class WorkerDict {
       <<RayActor>>
-      actor
-      checkpoint_engine
+      worker_dict
     }
     class CheckpointEngineManager {
       <<PlainObject>>
@@ -614,7 +636,7 @@ classDiagram
     FullyAsyncTrainer o-- FullyAsyncRollouter : ActorHandle
     FullyAsyncTrainer *-- RayWorkerGroup : actor_wg proxy
     FullyAsyncTrainer *-- CheckpointEngineManager : local object
-    RayWorkerGroup o-- DetachActorWorker : ActorHandles
+    RayWorkerGroup o-- WorkerDict : ActorHandles
     CheckpointEngineManager o-- RayWorkerGroup : trainer proxy
     CheckpointEngineManager o-- vLLMReplica : serialized object copies
 
@@ -710,10 +732,9 @@ classDiagram
       <<RayActor>>
       llm_client
     }
-    class DetachActorWorker {
+    class WorkerDict {
       <<RayActor>>
-      actor
-      checkpoint_engine
+      worker_dict
     }
     class LLMServerClient:::yellowClass {
       <<PlainObject>>
@@ -731,8 +752,8 @@ classDiagram
     MultiTaskFullyAsyncTrainer *-- MultiTaskCheckpointEngineManager
     MultiTaskCheckpointEngineManager *-- vLLMReplica
     MultiTaskCheckpointEngineManager *-- BorrowedRolloutReplica
-    MultiTaskFullyAsyncTrainer o-- DetachActorWorker : ActorHandles
-    MultiTaskCheckpointEngineManager o-- DetachActorWorker : RayWorkerGroup
+    MultiTaskFullyAsyncTrainer o-- WorkerDict : ActorHandles
+    MultiTaskCheckpointEngineManager o-- WorkerDict : RayWorkerGroup
 
     MultiTaskFullyAsyncRollouter *-- MultiTaskLLMServerManager
     MultiTaskFullyAsyncRollouter *-- FullyAsyncAgentLoopManager
@@ -843,11 +864,11 @@ flowchart TB
 
 #### 4.2.2.1 AS-IS 简化部署视图
 
-![示例图片](./img/as_is.png)
+![示例图片](./img/standalone_as_is.png)
 
 #### 4.2.2.2 TO-BE 简化部署视图
 
-![示例图片](./img/multi_task.png)
+![示例图片](./img/standalone_to_be.png)
 
 #### 4.2.2.3 AS-IS 部署视图
 
@@ -939,7 +960,7 @@ flowchart TB
         BS["vLLMHttpServer"]
         BE["AsyncLLM"]
         BLB["MultiTaskGlobalRequestLoadBalancer"]
-        BCE["MultiTaskCheckpointEngineManager"]
+        BCE["DetachActorWorker"]
         BCE ==>|B weights| DCW
         BS -.-> BE
         BLB ==>|B requests| BS
