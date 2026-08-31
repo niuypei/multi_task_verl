@@ -13,6 +13,7 @@
 |---|---|
 | 调度仓库 | `/Users/nyp/Documents/multi_task_verl` |
 | 调度仓库分支 | `main` |
+| 当前本地 HEAD | `6dba0d4`，`docs: organize RFC reference materials` |
 | 已推送 HEAD | `98394b1`，`docs: explain Ray worker binding and deployment views` |
 | 远端 | `git@github.com:niuypei/multi_task_verl.git` |
 | verl 源码 | `/Users/nyp/Documents/verl` |
@@ -158,6 +159,10 @@ Ray 原生资源冲突规避方案。
 - 原生 hook 对 `CheckpointEngineManager.replicas` 全量 abort，不支持只指定一个待回收 replica；
 - partial token、logprob、剩余预算和版本范围保存在 `AgentLoopWorkerTQ` 进程内的 client coroutine，不在
   TransferQueue、`vLLMReplica` 或 `CheckpointEngineManager`；
+- 正常 resume 不从 TransferQueue 读取中断 prompt；同一个 `FullyAsyncLLMServerClient.generate()` 活协程帧直接读取
+  原始 `prompt_ids` 和累计 `final_output.token_ids`，拼成下一次 backend 输入；
+- `FullyAsyncLLMServerClient` 普通对象本身没有 per-request 状态表；从 `background_tasks`、`_run_prompt` task、session
+  task、`AgentLoop.run()` 到 client generate coroutine frame 的 Python 引用链负责保活 partial 状态；
 - TQ 只保存 prompt 状态、恢复所需 prompt 数据和最终完整 trajectory；进程故障后的 reissue 会从原 prompt 重生成，
   不恢复 partial prefix；
 - resume 由 client while-loop 用同一 logical request ID 重新 acquire，并默认以新 backend UUID 提交
@@ -168,6 +173,10 @@ Ray 原生资源冲突规避方案。
 
 该能力可以作为 GroupScheduler 强制回收的基础，但跨 replica 迁移、持久化和故障恢复仍未由原生机制完整覆盖。
 完整证据链见 `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md`。
+
+文档 `15` 的 Mermaid 图已改为兼容性更高的基础语法：复杂并发图拆分为控制链和 partial 数据链，并新增 coroutine
+状态归属图；本轮同时补齐 `TokenOutput`、TransferQueue prompt record 和 checkpoint reissue 的数据结构与取数流程。
+使用 `@mermaid-js/mermaid-cli 11.16.0` 实际生成 SVG/PNG，7/7 个图均渲染成功并完成视觉检查。
 
 ### 5.2 STANDALONE `CheckpointEngineWorker`
 

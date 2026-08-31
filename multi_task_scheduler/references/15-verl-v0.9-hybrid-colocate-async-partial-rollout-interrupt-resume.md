@@ -19,6 +19,9 @@
 >
 > 外部依赖边界：verl 当前声明 `vllm>=0.18.0`，见 `setup.py:55`。本地分析环境未安装 vLLM，因此本文已逐行
 > 校验到 verl 调用 `AsyncLLM` 的边界；`AsyncLLM.pause_generation()` 内部实现不冒充 verl 本仓代码事实。
+>
+> 图表验证：使用 `@mermaid-js/mermaid-cli 11.16.0` 对本文 7 个 Mermaid block 实际生成 SVG 和 PNG，7/7 均成功，
+> 并完成 PNG 视觉检查；渲染产物仅用于校验，不纳入仓库。
 
 正文中的源码路径均相对 `/Users/nyp/Documents/verl`。为避免重复，首次给出完整路径后会使用短名，例如
 `trainer_base.py` 表示 `verl/trainer/ppo/v1/trainer_base.py`，`vllm_async_server.py` 表示
@@ -51,10 +54,10 @@ ReplayBufferAsync 已经凑够本次训练所需的完整 prompt groups
 3. 当前 hook 调用 `CheckpointEngineManager.abort_replicas()`，作用域是 manager 中的**所有 replicas**，不是某一个
    指定空闲或待回收 replica。
 4. 中断请求不会作为 partial trajectory 写回 TransferQueue；它对应的 prompt group 仍保持 `running`。
-5. 已生成前缀保存在 `AgentLoopWorkerTQ` Ray Actor 进程内、该请求的
-   `FullyAsyncLLMServerClient.generate()` 协程局部变量 `final_output` 中。
-6. `resume_generation_replicas()` 只解除服务端 pause，不直接通知或调用客户端；真正的续推由客户端 while-loop
-   自主重试驱动。
+5. 原始 `prompt_ids`、已生成前缀、剩余预算和版本范围都保存在 `AgentLoopWorkerTQ` Ray Actor 进程内、该请求的
+   `FullyAsyncLLMServerClient.generate()` **活协程帧**中；client 对象没有单独的 per-request 状态表。
+6. 正常续推不从 TransferQueue“取回中断 prompt”。`resume_generation_replicas()` 只解除服务端 pause；同一客户端
+   while-loop 直接读取自己的 `prompt_ids` 和 `final_output.token_ids`，拼成下一次 backend 输入。
 7. 续推不是恢复旧 KV cache。abort/sleep/weight update 会清理或重建缓存，客户端把 token 前缀拼回输入，backend
    重新 prefill。
 8. PPO 始终只消费完整 trajectory；partial 指“生成过程可跨中断、跨权重版本继续”，不指“用半条 response 训练”。
@@ -122,7 +125,7 @@ Rollout mode: RolloutMode.HYBRID
 | `ReplayBufferAsync` | controller 普通对象 | `PPOTrainer.replay_buffer` | 只选择 terminal prompt groups；凑够训练 batch 后解除 `sample()` 阻塞 | `trainer_base.py:142-188`、`replay_buffer.py:497-579` |
 | `AgentLoopManagerTQ` | controller 普通对象 | `TaskRunnerV1.agent_loop_manager` | 把 prompt chunks 远程分发给 AgentLoop actors | `agent_loop_tq.py:230-257` |
 | `AgentLoopWorkerTQ` | Ray Actor | 分布在 Ray 节点上的 CPU Actor | 为每个 prompt/session 保持后台 AgentLoop task；未完成请求的客户端协程就在此 Actor 内存活 | `agent_loop_tq.py:52-148` |
-| `FullyAsyncLLMServerClient` | `AgentLoopWorkerTQ` Actor 内普通对象 | 创建 AgentLoop actors时被序列化传入 | 保存 partial token 前缀并循环重新 acquire/generate | `llm_server.py:292-461`、`agent_loop.py:1201-1221` |
+| `FullyAsyncLLMServerClient` | `AgentLoopWorkerTQ` Actor 内普通对象 | 创建 AgentLoop actors时被序列化传入 | 每次 `generate()` 调用的活协程帧保存 partial 状态；client 对象循环重新 acquire/generate | `llm_server.py:292-461`、`agent_loop.py:1201-1221` |
 | `GlobalRequestLoadBalancer` | 运行时 Ray Actor | `LLMServerManager` 保存 ActorHandle | 根据逻辑 `request_id` 做 sticky/least-inflight 路由，返回 server ActorHandle | 类定义 `llm_server.py:46-194`；Actor 创建 `600-611` |
 | `LLMServerManager` | controller 普通对象 | `PPOTrainer.llm_server_manager` | 创建 replicas、server Actor 和 LB；不直接保存单请求 partial 状态 | `llm_server.py:464-637` |
 | `vLLMReplica` | controller 普通对象 | `LLMServerManager.rollout_replicas` | 保存训练 Worker handles 和 vLLM server ActorHandles；批量转发 abort/sleep/resume | `vllm_async_server.py:1102-1227` |
@@ -143,7 +146,7 @@ Rollout mode: RolloutMode.HYBRID
 ```mermaid
 flowchart TB
     subgraph DriverProcess["driver process"]
-        run_ppo["run_ppo()"]
+        RunPPO["run_ppo"]
     end
 
     subgraph TaskRunnerV1Process["TaskRunnerV1 Ray Actor process"]
@@ -154,7 +157,7 @@ flowchart TB
         LLMServerManager["LLMServerManager"]
         CheckpointEngineManager["CheckpointEngineManager"]
         RayWorkerGroup["RayWorkerGroup"]
-        vLLMReplica["vLLMReplica instances"]
+        vLLMReplica["vLLMReplica"]
     end
 
     subgraph AgentLoopActorProcesses["AgentLoopWorkerTQ Ray Actor processes"]
@@ -162,7 +165,7 @@ flowchart TB
         FullyAsyncLLMServerClient["FullyAsyncLLMServerClient"]
     end
 
-    GlobalRequestLoadBalancer["GlobalRequestLoadBalancer Ray Actor"]
+    GlobalRequestLoadBalancer["GlobalRequestLoadBalancer"]
 
     subgraph WorkerDictActorProcesses["WorkerDict Ray Actor processes"]
         WorkerDict["WorkerDict"]
@@ -171,42 +174,45 @@ flowchart TB
         ServerAdapter["ServerAdapter"]
     end
 
-    subgraph InferenceRuntime["same physical GPU set: vLLM control and execution runtime"]
-        vLLMHttpServer["vLLMHttpServer Ray Actor"]
+    subgraph InferenceRuntime["vLLM control and execution runtime"]
+        vLLMHttpServer["vLLMHttpServer"]
         AsyncLLM["AsyncLLM"]
-        vLLMWorkerProcesses["vLLM worker processes (external runtime)"]
+        vLLMWorkerProcesses["vLLM worker processes"]
         vLLMColocateWorkerExtension["vLLMColocateWorkerExtension"]
     end
 
-    transfer_queue["TransferQueue runtime"]
+    TransferQueueRuntime["TransferQueue runtime"]
 
-    run_ppo -.->|"ActorHandle.run.remote"| TaskRunnerV1
-    TaskRunnerV1 -->|"owns"| PPOTrainerColocateAsync
-    TaskRunnerV1 -->|"owns"| AgentLoopManagerTQ
-    PPOTrainerColocateAsync -->|"owns"| ReplayBufferAsync
-    PPOTrainerColocateAsync -->|"owns"| LLMServerManager
-    PPOTrainerColocateAsync -->|"owns"| CheckpointEngineManager
-    PPOTrainerColocateAsync -->|"owns proxy"| RayWorkerGroup
-    LLMServerManager -->|"owns"| vLLMReplica
-    LLMServerManager -.->|"ActorHandle"| GlobalRequestLoadBalancer
-    vLLMReplica -.->|"ActorHandles"| vLLMHttpServer
-    RayWorkerGroup -.->|"ActorHandles"| WorkerDict
-    WorkerDict -->|"owns"| ActorRolloutRefWorker
-    ActorRolloutRefWorker -->|"owns"| TrainingWorker
-    ActorRolloutRefWorker -->|"owns"| ServerAdapter
-    AgentLoopManagerTQ -.->|"ActorHandles"| AgentLoopWorkerTQ
-    AgentLoopWorkerTQ -->|"owns a serialized client copy"| FullyAsyncLLMServerClient
-    FullyAsyncLLMServerClient -.->|"acquire/release remote"| GlobalRequestLoadBalancer
-    GlobalRequestLoadBalancer -.->|"returns ActorHandle"| vLLMHttpServer
-    FullyAsyncLLMServerClient -.->|"generate.remote"| vLLMHttpServer
-    ServerAdapter -.->|"wake/update/control remote"| vLLMHttpServer
-    vLLMHttpServer -->|"owns on node-rank 0"| AsyncLLM
-    AsyncLLM -->|"launches/controls"| vLLMWorkerProcesses
-    vLLMWorkerProcesses -->|"loads extension"| vLLMColocateWorkerExtension
-    PPOTrainerColocateAsync ==>|"put prompt metadata and fields"| transfer_queue
-    AgentLoopWorkerTQ ==>|"status / complete trajectory"| transfer_queue
-    transfer_queue ==>|"metadata snapshot and complete trajectory keys"| ReplayBufferAsync
+    RunPPO -.-> TaskRunnerV1
+    TaskRunnerV1 --> PPOTrainerColocateAsync
+    TaskRunnerV1 --> AgentLoopManagerTQ
+    PPOTrainerColocateAsync --> ReplayBufferAsync
+    PPOTrainerColocateAsync --> LLMServerManager
+    PPOTrainerColocateAsync --> CheckpointEngineManager
+    PPOTrainerColocateAsync --> RayWorkerGroup
+    LLMServerManager --> vLLMReplica
+    LLMServerManager -.-> GlobalRequestLoadBalancer
+    vLLMReplica -.-> vLLMHttpServer
+    RayWorkerGroup -.-> WorkerDict
+    WorkerDict --> ActorRolloutRefWorker
+    ActorRolloutRefWorker --> TrainingWorker
+    ActorRolloutRefWorker --> ServerAdapter
+    AgentLoopManagerTQ -.-> AgentLoopWorkerTQ
+    AgentLoopWorkerTQ --> FullyAsyncLLMServerClient
+    FullyAsyncLLMServerClient -.-> GlobalRequestLoadBalancer
+    GlobalRequestLoadBalancer -.-> vLLMHttpServer
+    FullyAsyncLLMServerClient -.-> vLLMHttpServer
+    ServerAdapter -.-> vLLMHttpServer
+    vLLMHttpServer --> AsyncLLM
+    AsyncLLM --> vLLMWorkerProcesses
+    vLLMWorkerProcesses --> vLLMColocateWorkerExtension
+    PPOTrainerColocateAsync --> TransferQueueRuntime
+    AgentLoopWorkerTQ --> TransferQueueRuntime
+    TransferQueueRuntime --> ReplayBufferAsync
 ```
+
+图例：虚线表示 ActorHandle/远程调用关系；实线主要表示同进程持有关系，指向或来自 `TransferQueueRuntime` 的实线表示
+TransferQueue 数据流。图中不再把调用文字写进边标签，以兼容较旧的 Mermaid 渲染器；具体方法名由下文时序图给出。
 
 图中最容易误判的是：
 
@@ -367,31 +373,31 @@ self.trainer.get_llm_client()
 
 ```mermaid
 sequenceDiagram
-    participant PPOTrainerColocateAsync
-    participant TransferQueue
-    participant AgentLoopManagerTQ
-    participant AgentLoopWorkerTQ
-    participant FullyAsyncLLMServerClient
-    participant GlobalRequestLoadBalancer
-    participant vLLMHttpServer
-    participant AsyncLLM
+    participant Trainer as PPOTrainerColocateAsync
+    participant TQ as TransferQueue
+    participant Manager as AgentLoopManagerTQ
+    participant Worker as AgentLoopWorkerTQ
+    participant Client as FullyAsyncLLMServerClient
+    participant LB as GlobalRequestLoadBalancer
+    participant Server as vLLMHttpServer
+    participant Engine as AsyncLLM
 
-    PPOTrainerColocateAsync->>TransferQueue: kv_batch_put(uid, status=pending, prompt fields)
-    PPOTrainerColocateAsync->>AgentLoopManagerTQ: generate_sequences(batch)
-    AgentLoopManagerTQ->>AgentLoopWorkerTQ: generate_sequences.remote(chunk)
-    AgentLoopWorkerTQ-->>AgentLoopManagerTQ: background tasks created
-    AgentLoopWorkerTQ->>TransferQueue: async_kv_put(uid, status=running)
-    AgentLoopWorkerTQ->>FullyAsyncLLMServerClient: generate(logical request_id, prompt_ids, sampling_params)
-    FullyAsyncLLMServerClient->>GlobalRequestLoadBalancer: acquire_server.remote(logical request_id)
-    GlobalRequestLoadBalancer-->>FullyAsyncLLMServerClient: server_id, vLLMHttpServer ActorHandle
-    FullyAsyncLLMServerClient->>vLLMHttpServer: generate.remote(backend request_id, prompt_ids, ...)
-    vLLMHttpServer->>AsyncLLM: generate(prompt, SamplingParams, backend request_id)
-    AsyncLLM-->>vLLMHttpServer: final RequestOutput
-    vLLMHttpServer-->>FullyAsyncLLMServerClient: TokenOutput(tokens, logprobs, stop_reason, global_steps)
-    FullyAsyncLLMServerClient->>GlobalRequestLoadBalancer: release_server.remote(server_id)
-    FullyAsyncLLMServerClient-->>AgentLoopWorkerTQ: complete TokenOutput
-    AgentLoopWorkerTQ->>TransferQueue: async_kv_batch_put(complete AgentLoopOutput)
-    AgentLoopWorkerTQ->>TransferQueue: async_kv_put(uid, status=finished) after all sessions settle
+    Trainer->>TQ: kv_batch_put prompt fields and pending tag
+    Trainer->>Manager: generate_sequences
+    Manager->>Worker: generate_sequences remote
+    Worker-->>Manager: background tasks created
+    Worker->>TQ: set prompt status to running
+    Worker->>Client: generate with logical request ID
+    Client->>LB: acquire_server remote
+    LB-->>Client: server ID and ActorHandle
+    Client->>Server: generate remote with backend request ID
+    Server->>Engine: generate
+    Engine-->>Server: final RequestOutput
+    Server-->>Client: TokenOutput
+    Client->>LB: release_server remote
+    Client-->>Worker: complete accumulated TokenOutput
+    Worker->>TQ: write complete AgentLoopOutput
+    Worker->>TQ: set prompt status to finished
 ```
 
 关键实现：
@@ -494,45 +500,57 @@ self.checkpoint_manager.sleep_replicas()
 
 ## 7. 中断控制链：从 Trainer 到 vLLM，再返回 partial token
 
-### 7.1 全量时序
+### 7.1 控制链与 partial 数据链
+
+中断控制 RPC 与原有 `generate.remote()` 的返回数据属于两条并发链。为了避免用复杂 `par/and` 语法造成 Mermaid
+兼容问题，下面拆成两张时序图；两张图发生在同一次 `on_sample_end()` 中。
+
+控制链：
 
 ```mermaid
 sequenceDiagram
-    participant PPOTrainerColocateAsync
-    participant ReplayBufferAsync
-    participant CheckpointEngineManager
-    participant vLLMReplica
-    participant vLLMHttpServer
-    participant AsyncLLM
-    participant FullyAsyncLLMServerClient
-    participant GlobalRequestLoadBalancer
-    participant AgentLoopWorkerTQ
+    participant Buffer as ReplayBufferAsync
+    participant Trainer as PPOTrainerColocateAsync
+    participant CE as CheckpointEngineManager
+    participant Replica as vLLMReplica
+    participant Server as vLLMHttpServer
+    participant Engine as AsyncLLM
 
-    ReplayBufferAsync-->>PPOTrainerColocateAsync: selected complete KVBatchMeta
-    PPOTrainerColocateAsync->>CheckpointEngineManager: abort_replicas()
-    par abort control path for every replica/server
-        CheckpointEngineManager->>vLLMReplica: abort_all_requests()
-        vLLMReplica->>vLLMHttpServer: abort_all_requests.remote() on every node server
-        vLLMHttpServer->>AsyncLLM: pause_generation(wait_for_inflight_requests=False, clear_cache=True)
-        AsyncLLM-->>vLLMHttpServer: pause/drain completes
-        vLLMHttpServer-->>vLLMReplica: {aborted_count, backend request_ids} or {error}
-        vLLMReplica-->>CheckpointEngineManager: aggregate abort result
-    and outstanding generate RPC data path
-        AsyncLLM-->>vLLMHttpServer: RequestOutput(finish_reason=abort, partial tokens or empty outputs)
-        vLLMHttpServer-->>FullyAsyncLLMServerClient: TokenOutput(stop_reason=aborted, partial tokens)
-        FullyAsyncLLMServerClient->>GlobalRequestLoadBalancer: release_server.remote(server_id)
-        FullyAsyncLLMServerClient->>FullyAsyncLLMServerClient: merge into final_output; reduce remaining budget
-        FullyAsyncLLMServerClient->>FullyAsyncLLMServerClient: sleep(1), then retry loop
-        Note over AgentLoopWorkerTQ,FullyAsyncLLMServerClient: AgentLoop task stays alive; prompt group remains running
-    end
-    Note over CheckpointEngineManager: abort_replicas() discards aggregate return values
-    CheckpointEngineManager-->>PPOTrainerColocateAsync: abort chain completed
-    PPOTrainerColocateAsync->>CheckpointEngineManager: sleep_replicas()
-    CheckpointEngineManager->>vLLMReplica: sleep()
-    vLLMReplica->>vLLMHttpServer: wait_for_requests_to_drain.remote() on head
-    vLLMReplica->>vLLMHttpServer: sleep.remote() on every node server
-    vLLMHttpServer->>AsyncLLM: sleep(level=1 or 2)
-    Note over PPOTrainerColocateAsync,FullyAsyncLLMServerClient: client retry loop survives independently while Trainer enters PPO work
+    Buffer-->>Trainer: selected complete KVBatchMeta
+    Trainer->>CE: abort_replicas
+    CE->>Replica: abort_all_requests
+    Replica->>Server: abort_all_requests remote
+    Server->>Engine: pause_generation and clear cache
+    Engine-->>Server: pause and drain complete
+    Server-->>Replica: abort result
+    Replica-->>CE: aggregate abort result
+    CE-->>Trainer: abort completed
+    Note right of CE: aggregate return values are discarded
+    Trainer->>CE: sleep_replicas
+    CE->>Replica: sleep
+    Replica->>Server: wait_for_requests_to_drain remote
+    Replica->>Server: sleep remote
+    Server->>Engine: sleep
+```
+
+原有 generate RPC 的 partial 数据返回链：
+
+```mermaid
+sequenceDiagram
+    participant Engine as AsyncLLM
+    participant Server as vLLMHttpServer
+    participant Client as FullyAsyncLLMServerClient
+    participant LB as GlobalRequestLoadBalancer
+    participant Worker as AgentLoopWorkerTQ
+
+    Engine-->>Server: RequestOutput with abort reason
+    Server-->>Client: partial TokenOutput
+    Client->>LB: release_server remote
+    Client->>Client: append tokens and log probabilities
+    Client->>Client: update remaining budget and versions
+    Client->>Client: wait and continue retry loop
+    Note over Client,Worker: AgentLoop task stays alive
+    Note over Client,Worker: TransferQueue prompt status remains running
 ```
 
 ### 7.2 manager 和 replica 的作用域
@@ -617,102 +635,221 @@ rollout 显存依赖 `rollout.free_cache_engine=True`。当前 rollout 默认配
 这一步使同一批 GPU 可以转入训练阶段。共卡 async 的“async”指 host 侧 AgentLoop/TQ/request 生命周期可以跨 step
 重叠，不表示同一批 GPU 同时执行 training kernels 和 rollout kernels。
 
-## 8. partial 状态究竟保存在哪里
+## 8. 中断结果保存在什么组件，恢复如何拿到 prompt
 
-### 8.1 状态归属矩阵
+### 8.1 直接结论：正常续推没有“从队列取回”动作
 
-| 状态 | 中断前/后保存位置 | 中断后是否保留 | 是否在此时进入 PPO batch |
+中断时必须区分原始 prompt、tokenized prompt 和 partial output：
+
+| 数据 | 运行时形态 | 实际保存位置 | 正常 partial resume 是否从这里读取 |
 |---|---|---|---|
-| 数据集原始 prompt fields | TransferQueue prompt key；AgentLoop task 也持有本地输入 | 是；用于 async checkpoint 后重新提交 | 否 |
-| prompt group `pending/running/finished/failure` | TransferQueue tag | 是；中断请求保持 `running` | 只有 terminal group 才可能被采样 |
-| 本次 LLM turn 的 `prompt_ids` | `FullyAsyncLLMServerClient.generate()` 协程局部变量 | 正常进程存活时是 | 否 |
-| 已生成 `token_ids` | 同一协程的 `final_output.token_ids` | 是，逐 attempt append | 否 |
-| 已生成 token 的 `log_probs` | `final_output.log_probs` | 是，逐 attempt append | 否 |
-| MoE `routed_experts` | `final_output.routed_experts` | 是，只拼接新 token 对应 rows | 否 |
-| 原始/剩余 token budget | 协程局部 `original_max_tokens` 和重写后的 `sampling_params` | 是 | 否 |
-| 生成使用的权重版本范围 | 协程局部 `min_global_steps/max_global_steps` | 是，最终写入 output/TQ tags | 完整结束前否 |
-| logical request → server sticky mapping | `GlobalRequestLoadBalancer._request_id_to_server` | server 未移除时保留 | 否 |
-| backend request state 和 KV cache | `AsyncLLM` / vLLM workers | abort/sleep 后不作为续推依据 | 否 |
-| abort 的 backend request ID 列表 | abort RPC 临时返回值 | manager 当前丢弃 | 否 |
-| 完整 `AgentLoopOutput` | AgentLoop 完成后写入 TransferQueue trajectory keys | 是 | 可由后续 `ReplayBufferAsync.sample()` 选择 |
+| 数据集原始 prompt 记录 | TransferQueue key=`uid` 的 tag + fields | TransferQueue runtime | 否；它用于状态追踪和 checkpoint/restart |
+| 当前 prompt group 输入 | `_run_prompt()` 的 `prompt: dict` | `AgentLoopWorkerTQ` 的活 task/coroutine | 间接保活 session task，但不负责拼接 partial token |
+| 当前 LLM turn 的 tokenized prompt | `prompt_ids: list[int]` | `FullyAsyncLLMServerClient.generate()` 活协程帧 | 是，下一轮循环直接读取局部变量 |
+| 中断前已经生成的输出 | `final_output: TokenOutput` | 同一个 `generate()` 活协程帧 | 是，读取 `final_output.token_ids` 作为前缀 |
+| 剩余预算和版本范围 | `sampling_params`、`original_max_tokens`、`min_global_steps/max_global_steps` | 同一个活协程帧 | 是 |
+| 完整 trajectory | `AgentLoopOutput` 转换后的 TransferQueue trajectory record | 只在整个 AgentLoop 完成后写入 TransferQueue | 中断当下尚不存在 |
 
-关键数据对象之间的转换为：
+因此准确说法是：**partial output 位于 `AgentLoopWorkerTQ` Ray Actor 进程中的 Python coroutine frame，不在
+TransferQueue、`vLLMReplica`、`CheckpointEngineManager` 或 `GlobalRequestLoadBalancer` 中。**
 
-| 数据对象 | 主要字段 | 产生方 → 消费方 | 代码位置 |
-|---|---|---|---|
-| `TokenOutput` | `token_ids`、`log_probs`、`routed_experts`、`stop_reason`、`num_preempted`、`extra_fields` | `vLLMHttpServer` → `LLMServerClient`/`FullyAsyncLLMServerClient` | `replica.py:39-51`、`vllm_async_server.py:689-696` |
-| accumulated `TokenOutput` | 多个 attempt 拼接后的上述字段，以及 `min/max_global_steps` | `FullyAsyncLLMServerClient` → 当前 AgentLoop | `llm_server.py:397-461` |
-| `AgentLoopOutput` | `prompt_ids`、完整 `response_ids`、mask、response logprobs、metrics、extra fields | 具体 AgentLoop → `AgentLoopWorkerTQ._agent_loop_postprocess()` | `experimental/agent_loop/agent_loop.py:90-157` |
-| TransferQueue prompt record | uid、`is_prompt=True`、status、提交版本和恢复字段 | Trainer/AgentLoop → `ReplayBufferAsync` | `trainer_base.py:1345-1358`、`agent_loop_tq.py:107-148` |
-| TransferQueue trajectory record | `{uid}_{session_id}_{index}`、完整 tensor fields、版本 tags | `AgentLoopWorkerTQ` → `ReplayBufferAsync`/Trainer | `agent_loop_tq.py:177-227` |
-| `KVBatchMeta` | selected trajectory keys、tags、partition ID | `ReplayBufferAsync` → `PPOTrainer._step_once()` | `replay_buffer.py:377-389,541-579` |
+### 8.2 哪条引用链让协程状态在中断后继续存活
 
-### 8.2 FullyAsyncLLMServerClient 的核心循环
+```mermaid
+flowchart TB
+    Worker["AgentLoopWorkerTQ Ray Actor"]
+    Background["background_tasks set"]
+    PromptTask["_run_prompt asyncio Task"]
+    SessionTask["_run_agent_loop asyncio Task"]
+    AgentRun["SingleTurnAgentLoop.run coroutine"]
+    Client["FullyAsyncLLMServerClient"]
+    GenerateFrame["FullyAsyncLLMServerClient.generate coroutine frame"]
+    PartialState["prompt_ids, final_output, budget, versions"]
+    Server["vLLMHttpServer Ray Actor"]
 
-实际代码位于 `llm_server.py:345-461`，等价伪码为：
-
-```python
-async def generate(request_id, prompt_ids, sampling_params):
-    original_budget = resolve_max_tokens_or_response_length(sampling_params)
-    params = copy(sampling_params)
-    final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
-    min_version = None
-    max_version = None
-
-    while True:
-        output = await LLMServerClient.generate(
-            request_id=request_id,                  # logical ID 不变
-            prompt_ids=prompt_ids + final_output.token_ids,
-            sampling_params=params,
-        )
-
-        final_output.token_ids.extend(output.token_ids)
-        final_output.log_probs.extend(output.log_probs or [])
-        merge_routed_experts_and_preemption_metrics(final_output, output)
-
-        version = output.extra_fields["global_steps"]
-        min_version = version if min_version is None else min_version
-        max_version = version
-
-        params[limit_key] = original_budget - len(final_output.token_ids)
-        if len(final_output.token_ids) >= original_budget:
-            final_output.stop_reason = "length"
-            break
-
-        if output.stop_reason not in ("aborted", "abort"):
-            break
-
-        await asyncio.sleep(1)
-
-    final_output.extra_fields.update(
-        global_steps=max_version,
-        min_global_steps=min_version,
-        max_global_steps=max_version,
-    )
-    return final_output
+    Worker --> Background
+    Background --> PromptTask
+    PromptTask --> SessionTask
+    SessionTask --> AgentRun
+    Worker --> Client
+    AgentRun --> Client
+    AgentRun --> GenerateFrame
+    GenerateFrame --> Client
+    GenerateFrame --> PartialState
+    Server -.-> GenerateFrame
 ```
 
-代码中的关键细节：
+图中 `asyncio Task`、coroutine frame 和 `PartialState` 是 Python 运行时实体，不是 verl 新增类：
 
-- 先复制 `sampling_params`，避免修改 AgentLoop caller 的对象：`llm_server.py:374-395`；
-- 每次 attempt 使用 `prompt_ids + final_output.token_ids`：`404-415`；
-- token、logprob、routing 和 preemption 指标合并：`417-432`；
-- 记录首尾权重版本：`434-438`；
-- 剩余预算为 `original_max_tokens - accumulated_tokens`：`440-445`；
-- V1 config 不含旧 `async_training` 字段，因此当前 V1 路径 `should_retry` 始终为 `True`：`447-456`；
-- 最终写入版本元数据：`458-461`。
+1. `AgentLoopWorkerTQ.__init__()` 创建 `self.background_tasks: set`，每个 prompt 的 `_run_prompt` task 被加入该集合，
+   完成后才移除，见 `agent_loop_tq.py:52-57,100-105`。
+2. `_run_prompt()` 的局部 `tasks` 列表持有各 session 的 `_run_agent_loop` task，并等待它们全部 settle，见
+   `agent_loop_tq.py:107-143`。
+3. `_run_agent_loop()` 构造具体 AgentLoop，并等待 `agent_loop.run()` 返回，见
+   `experimental/agent_loop/agent_loop.py:675-708`。
+4. `SingleTurnAgentLoop.run()` 等待 `self.server_manager.generate()`；这里的 `server_manager` 实际是传入 Actor 的
+   `FullyAsyncLLMServerClient` 普通对象，见 `single_turn_agent_loop.py:63-76`、`agent_loop.py:219-233`。
+5. `FullyAsyncLLMServerClient.generate()` 在收到非 abort 的终止原因之前不会返回，所以以上 task/coroutine 引用链持续
+   保有其局部变量。
 
-### 8.3 为什么不是“放回 TransferQueue”
+图中用默认 `SingleTurnAgentLoop` 展示一条 session。对于多轮 AgentLoop，每一个正在进行的 LLM turn 都会形成独立的
+`FullyAsyncLLMServerClient.generate()` 调用和独立 coroutine frame；verl 没有按 prompt-group UID 集中保存所有 turn
+partial state 的公共对象。
 
-在 aborted attempt 之后，`FullyAsyncLLMServerClient` 没有调用任何 `tq.*` 接口；它只在原 coroutine 中更新
-`final_output` 并进入下一次循环。
+`FullyAsyncLLMServerClient` 由 controller 创建，再作为 Ray Actor 构造参数传给每个 `AgentLoopWorkerTQ`；每个 Actor
+获得一份反序列化后的普通对象，见 `trainer_colocate_async.py:32-34`、`llm_server.py:613-629`、
+`experimental/agent_loop/agent_loop.py:1166-1221`。但是 client 对象本身只有配置和 LB ActorHandle，见
+`llm_server.py:204-220`；它没有 `dict[request_id, partial_state]` 一类成员。
 
-`AgentLoopWorkerTQ._agent_loop_postprocess()` 只有在 AgentLoop 的 `run()` 最终返回后，才把 trajectory fields 写入
-TransferQueue，见 `agent_loop.py:675-708`、`agent_loop_tq.py:150-227`。
+### 8.3 partial output 和 TransferQueue prompt record 的具体数据结构
 
-`RolloutReplica.abort_all_requests()` 的 docstring 使用了“abort and save”措辞，见 `replica.py:273-275`，但实际方法只
-并发调用 server abort；它没有 queue、没有 token buffer，也没有保存逻辑。这里应以实现为准：所谓“保存”是客户端收到
-`TokenOutput` 后在协程局部 `final_output` 中累计，而不是 replica 保存请求。
+vLLM server 返回的对象是 Pydantic `TokenOutput`：
+
+```python
+class TokenOutput(BaseModel):
+    token_ids: list[int]
+    log_probs: Optional[list[float]] = None
+    routed_experts: Optional[Any] = None
+    stop_reason: Optional[str] = None
+    num_preempted: Optional[int] = None
+    extra_fields: dict[str, Any] = {}
+```
+
+定义见 `verl/workers/rollout/replica.py:39-51`。abort attempt 返回时，vLLM adapter 将
+`RequestOutput.outputs[0].token_ids/logprobs` 写入该对象，把 `finish_reason="abort"` 映射成
+`stop_reason="aborted"`，并把 rollout 版本写入 `extra_fields["global_steps"]`；如果 outputs 为空，则返回空 token
+列表，见 `vllm_async_server.py:624-664,689-696`。
+
+一次活跃 client 调用的完整恢复状态不是具名类，而是一组 coroutine locals，可概念化为：
+
+```python
+# Conceptual only: verl 中不存在 PartialCallState 类
+PartialCallState = {
+    "request_id": str,                  # logical request ID
+    "prompt_ids": list[int],            # 本 LLM turn 的原始 tokenized prompt
+    "sampling_params": dict,            # 已复制；max_tokens 会改成剩余预算
+    "original_max_tokens": int | None,
+    "final_output": TokenOutput(        # 多次 attempt 的累计输出
+        token_ids=[...],
+        log_probs=[...],
+        routed_experts=...,
+        stop_reason="aborted",
+        num_preempted=...,
+    ),
+    "min_global_steps": int | None,
+    "max_global_steps": int | None,
+    "image_data/video_data/audio_data": ...,
+}
+```
+
+这些变量对应 `llm_server.py:346-402,404-461`。其中 `final_output.extra_fields` 的版本字段是在整个 while-loop 结束时
+才统一补齐；循环过程中版本上下界首先存在独立局部变量中，见 `434-460`。
+
+TransferQueue 中的 prompt record 是另一套结构：
+
+```python
+key = uid
+tag = {
+    "is_prompt": True,
+    "status": "pending" | "running" | "finished" | "failure",
+    "global_steps": submitted_step,
+}
+fields = TensorDictRow(...)  # 原 batch 中除 NonTensorData 外的字段
+```
+
+异步 Trainer 在提交时用 `fields=batch.select(...)` 持久化 prompt 数据，见 `trainer_base.py:1345-1360`。实际 CPU
+测试证明一个最小 batch 写入的 fields 是 `uid`、`raw_prompt` 和 `index`，见
+`tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py:180-188`；真实数据集还可以包含同批次的其他 tensor 或
+`NonTensorStack` 字段。`global_steps` 是 `NonTensorData`，不在 fields 中，而是放在 tag 并在重发时重新赋值。
+
+只有 AgentLoop 完整返回后才会创建 trajectory record：
+
+```text
+key    = {uid}_{session_id}_{index}
+fields = prompts, responses, response_mask, rollout_log_probs, extra_fields, ...
+tag    = status=success, prompt_len, response_len, min/max_global_steps, ...
+```
+
+代码：`agent_loop_tq.py:150-227`。因此 prompt record 的 `status="running"` 只能说明任务仍在执行，不能从中取得 partial
+token 前缀。
+
+### 8.4 abort 后 partial output 如何进入协程状态
+
+数据流依次是：
+
+1. `AsyncLLM.generate()` 的现有 async generator 因 abort 产出最终 `RequestOutput`；
+2. `vLLMHttpServer.generate()` 将它转换为 `TokenOutput`；
+3. 基类 `LLMServerClient.generate()` 等待 `server.generate.remote()` 返回，并在 `finally` 中释放 LB inflight 计数，见
+   `llm_server.py:262-289`；
+4. 外层 `FullyAsyncLLMServerClient.generate()` 把 segment 的 token、logprob、routing 和 preemption 数据 append 到
+   `final_output`，更新剩余预算和版本上下界，见 `llm_server.py:417-445`；
+5. 当 `stop_reason` 是 `aborted/abort` 时，协程只执行 `await asyncio.sleep(1)`，然后继续同一个 while-loop，见
+   `llm_server.py:447-456`。
+
+此时 `SingleTurnAgentLoop.run()` 仍停在 `await self.server_manager.generate(...)`；它还没有得到最终 `TokenOutput`，
+`AgentLoopWorkerTQ._agent_loop_postprocess()` 也不会执行，所以没有 partial `AgentLoopOutput` 写入 TransferQueue。
+
+### 8.5 正常恢复时如何“取出”中断 prompt
+
+正常恢复其实是同一个 coroutine frame 的下一轮循环，等价伪码为：
+
+```python
+while True:
+    attempt_prompt_ids = prompt_ids + final_output.token_ids
+    output = await LLMServerClient.generate(
+        request_id=request_id,
+        prompt_ids=attempt_prompt_ids,
+        sampling_params=sampling_params,
+    )
+    merge_into(final_output, output)
+    sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+    if output.stop_reason not in ("aborted", "abort"):
+        break
+    await asyncio.sleep(1)
+```
+
+这里没有 lookup key，也没有 `tq.kv_get()`：
+
+- 原始 tokenized prompt 直接来自协程参数 `prompt_ids`；
+- 中断输出直接来自同一帧的 `final_output.token_ids`；
+- 二者在 `llm_server.py:404-415` 拼接成新的 backend 输入；
+- logical `request_id` 保持不变，但基类默认在每个 attempt 生成新的 backend vLLM UUID，见
+  `llm_server.py:231-237,406-415`；
+- `resume_generation_replicas()` 只沿 CE → replica → server 调用 `AsyncLLM.resume_generation()`，没有 client ActorHandle，
+  也不读取 client 状态，见 `checkpoint_engine/base.py:462-465`、`vllm_async_server.py:893-897,1225-1227`。
+
+客户端的 1 秒重试计时器与 Trainer 的 resume RPC 没有直接握手。下一次 `generate.remote()` 可能在 server 恢复前或恢复后
+提交；从 verl 可见边界能确认的是，它始终使用同一协程内的 `prompt_ids + final_output.token_ids`，而 generation 只有在
+backend 被 resume 后才能继续取得新 token。
+
+CPU 测试直接记录了每次 attempt 收到的 prompt：初始 `[1,2,3]`，第一次 abort 后变成
+`[1,2,3,101,102]`，第二次 abort 后变成 `[1,2,3,101,102,103]`，见
+`tests/workers/rollout/test_llm_server_routed_experts_on_cpu.py:65-89,98-132`。累计 response budget 的测试还验证每次
+attempt 只获得剩余 token 配额，见 `tests/workers/rollout/test_llm_server_response_length_cap_on_cpu.py:60-82,109-135`。
+
+### 8.6 checkpoint/restart 才会从 TransferQueue 取原始 prompt
+
+如果 `AgentLoopWorkerTQ` 或其进程退出，上述 task、AgentLoop 实例和 client coroutine frame 都会消失，
+`final_output.token_ids` 无法恢复。checkpoint/restart 走的是另一条路径：
+
+1. Trainer 用 `tq.kv_list()` 查找 tag 为 `is_prompt=True` 且 status 为 `pending/running` 的 UID；
+2. 用 `tq.kv_batch_get(keys=inflight_uids)` 读取这些 UID 对应的原始 prompt fields，返回一个 batch；
+3. 清理同 UID 下可能残留的旧 trajectory keys；
+4. 给 batch 写入当前 `global_steps`，把 prompt tag 重置为 `pending`；
+5. 调用 `AgentLoopManagerTQ.generate_sequences(batch)` 从原 prompt 重新创建 tasks。
+
+代码：`trainer_base.py:847-883`；调用点为 `fit()` 的 `trainer_base.py:425-432`。CPU 测试验证了重发 batch 保留
+`raw_prompt`，但使用恢复后的新 `global_steps`，见
+`tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py:236-288`。
+
+| 场景 | 数据来源 | partial token 是否保留 | 恢复语义 |
+|---|---|---|---|
+| 正常 abort/sleep/resume | 活 client coroutine frame | 是 | `prompt_ids + final_output.token_ids` 重新 prefill |
+| Task/Actor 进程故障后的 checkpoint reissue | TransferQueue prompt record | 否 | 读取 `raw_prompt` 等原始 fields，从头重新生成 |
+
+`RolloutReplica.abort_all_requests()` 的 docstring 使用“abort and save”措辞，见 `replica.py:273-275`，但该实现只并发
+调用 server abort。真正的“save”是正常进程存活时 client coroutine 对 `final_output` 的内存累计，不是 replica 保存请求，
+更不是 TransferQueue 的 partial checkpoint。
 
 ## 9. 训练、参数同步与重新开放 generation
 
@@ -749,42 +886,41 @@ self.checkpoint_manager.resume_generation_replicas()
 
 ```mermaid
 sequenceDiagram
-    participant PPOTrainerColocateAsync
-    participant CheckpointEngineManager
-    participant RayWorkerGroup
-    participant WorkerDict
-    participant ActorRolloutRefWorker
-    participant TrainingWorker
-    participant ServerAdapter
-    participant vLLMHttpServer
-    participant vLLMColocateWorkerExtension
-    participant vLLMReplica
-    participant AsyncLLM
-    participant FullyAsyncLLMServerClient
+    participant Trainer as PPOTrainerColocateAsync
+    participant CE as CheckpointEngineManager
+    participant WG as RayWorkerGroup
+    participant WD as WorkerDict
+    participant ARW as ActorRolloutRefWorker
+    participant TW as TrainingWorker
+    participant Adapter as ServerAdapter
+    participant Server as vLLMHttpServer
+    participant Extension as vLLMColocateWorkerExtension
+    participant Replica as vLLMReplica
+    participant Engine as AsyncLLM
 
-    PPOTrainerColocateAsync->>CheckpointEngineManager: update_weights(global_steps)
-    CheckpointEngineManager->>RayWorkerGroup: update_weights(global_steps, mode="naive")
-    RayWorkerGroup->>WorkerDict: actor-role update_weights.remote(...)
-    WorkerDict->>ActorRolloutRefWorker: update_weights(...)
-    ActorRolloutRefWorker->>ServerAdapter: resume(tags=["weights"])
-    ServerAdapter->>vLLMHttpServer: wake_up.remote(tags=["weights"])
-    vLLMHttpServer->>AsyncLLM: wake_up(weights), reset_prefix_cache
-    ActorRolloutRefWorker->>TrainingWorker: actor.engine.get_per_tensor_param(...)
-    ActorRolloutRefWorker->>ServerAdapter: update_weights(per_tensor_param, global_steps)
-    ServerAdapter->>vLLMHttpServer: collective_rpc.remote("update_weights_from_ipc")
-    ServerAdapter->>vLLMColocateWorkerExtension: BucketedWeightSender via ZMQ/CUDA IPC
-    vLLMColocateWorkerExtension-->>ServerAdapter: all buckets loaded
-    ServerAdapter->>vLLMHttpServer: clear_kv_cache.remote()
-    ServerAdapter->>vLLMHttpServer: set_global_steps.remote(global_steps)
-    ActorRolloutRefWorker->>ServerAdapter: resume(tags=["kv_cache"])
-    ServerAdapter->>vLLMHttpServer: wake_up.remote(tags=["kv_cache"])
-    CheckpointEngineManager-->>PPOTrainerColocateAsync: weight update completed
+    Trainer->>CE: update_weights
+    CE->>WG: update_weights in naive mode
+    WG->>WD: actor role update_weights remote
+    WD->>ARW: update_weights
+    ARW->>Adapter: resume weight memory
+    Adapter->>Server: wake_up weights remote
+    Server->>Engine: wake_up weights and reset cache
+    ARW->>TW: get_per_tensor_param
+    ARW->>Adapter: update_weights
+    Adapter->>Server: collective_rpc update_weights_from_ipc
+    Adapter->>Extension: send buckets with ZMQ and CUDA IPC
+    Extension-->>Adapter: all buckets loaded
+    Adapter->>Server: clear_kv_cache remote
+    Adapter->>Server: set_global_steps remote
+    ARW->>Adapter: resume KV cache memory
+    Adapter->>Server: wake_up KV cache remote
+    CE-->>Trainer: weight update completed
 
-    PPOTrainerColocateAsync->>CheckpointEngineManager: resume_generation_replicas()
-    CheckpointEngineManager->>vLLMReplica: resume_generation()
-    vLLMReplica->>vLLMHttpServer: resume_generation.remote()
-    vLLMHttpServer->>AsyncLLM: resume_generation()
-    Note over AsyncLLM,FullyAsyncLLMServerClient: paused/retried generate calls can now make progress on the new version
+    Trainer->>CE: resume_generation_replicas
+    CE->>Replica: resume_generation
+    Replica->>Server: resume_generation remote
+    Server->>Engine: resume_generation
+    Note right of Engine: retried generate calls can progress on the new version
 ```
 
 代码证据：
@@ -809,29 +945,31 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant FullyAsyncLLMServerClient
-    participant GlobalRequestLoadBalancer
-    participant vLLMHttpServer
-    participant AsyncLLM
-    participant AgentLoopWorkerTQ
-    participant TransferQueue
-    participant ReplayBufferAsync
+    participant Client as FullyAsyncLLMServerClient
+    participant LB as GlobalRequestLoadBalancer
+    participant Server as vLLMHttpServer
+    participant Engine as AsyncLLM
+    participant Worker as AgentLoopWorkerTQ
+    participant TQ as TransferQueue
+    participant Buffer as ReplayBufferAsync
 
-    Note over FullyAsyncLLMServerClient: final_output already contains prefix tokens and logprobs
-    FullyAsyncLLMServerClient->>GlobalRequestLoadBalancer: acquire_server.remote(same logical request_id)
-    GlobalRequestLoadBalancer-->>FullyAsyncLLMServerClient: sticky server handle or newly selected active handle
-    FullyAsyncLLMServerClient->>vLLMHttpServer: generate.remote(new backend request_id by default, original prompt + prefix, remaining budget)
-    vLLMHttpServer->>AsyncLLM: generate(...)
-    Note over AsyncLLM: prefill the concatenated token sequence; old KV cache is not required
-    AsyncLLM-->>vLLMHttpServer: next segment or final segment
-    vLLMHttpServer-->>FullyAsyncLLMServerClient: TokenOutput(new tokens, new-version logprobs, global_steps)
-    FullyAsyncLLMServerClient->>FullyAsyncLLMServerClient: append segment and update min/max versions
-    alt aborted again
-        FullyAsyncLLMServerClient->>FullyAsyncLLMServerClient: sleep(1) and repeat
-    else stop/EOS/length
-        FullyAsyncLLMServerClient-->>AgentLoopWorkerTQ: complete accumulated TokenOutput
-        AgentLoopWorkerTQ->>TransferQueue: write complete trajectory and terminal prompt status
-        ReplayBufferAsync->>TransferQueue: select in a later sample() call
+    Note right of Client: same coroutine reads prompt_ids and final_output.token_ids
+    Client->>LB: acquire_server with same logical ID
+    LB-->>Client: active server ActorHandle
+    Client->>Server: generate new backend request
+    Note over Client,Server: input is original prompt plus accumulated prefix
+    Server->>Engine: generate
+    Note right of Engine: prefill concatenated token sequence
+    Engine-->>Server: next output segment
+    Server-->>Client: TokenOutput
+    Client->>Client: append segment and update versions
+    alt output is aborted
+        Client->>Client: wait and repeat
+    else output is terminal
+        Client-->>Worker: complete accumulated TokenOutput
+        Worker->>TQ: write complete trajectory
+        Worker->>TQ: set prompt status to finished
+        Buffer->>TQ: select in a later sample call
     end
 ```
 
@@ -1000,7 +1138,7 @@ Task/Actor 进程故障后 checkpoint reissue = 从持久化 prompt 重新生成
 
 ### 12.3 仓内测试对上述语义的覆盖
 
-verl 仓内已有三组直接证据：
+verl 仓内已有五组直接证据：
 
 1. `tests/workers/rollout/rollout_vllm/test_vllm_abort.py:141-212` 并发启动 generation，调用
    `abort_all_requests.remote()`，检查所有请求均能返回，并打印/统计 `stop_reason="aborted"` 请求已生成的 partial
@@ -1010,9 +1148,13 @@ verl 仓内已有三组直接证据：
    aborted 结束，且 `min_global_steps` 是旧版本、`max_global_steps` 已跨到新版本。
 3. `tests/workers/rollout/test_llm_server_response_length_cap_on_cpu.py:109-135` 模拟多次 abort，验证各 attempt 获得的
    remaining budget 总和不超过配置的 `response_length`。
+4. `tests/workers/rollout/test_llm_server_routed_experts_on_cpu.py:65-89,98-132` 记录三次 attempt 的输入，直接断言后续输入
+   是原始 `prompt_ids` 加已经累计的 token 前缀。
+5. `tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py:236-288` 验证 checkpoint reissue 只重发 pending/running UID，
+   从 TQ 恢复 `raw_prompt` 并重置 `global_steps`，不会恢复 partial token。
 
-本次环境没有安装 vLLM，也没有 GPU runtime，因此没有执行前两项 GPU 集成测试；本文对 verl 代码和测试逻辑完成了
-静态核对，不把“未在本机执行”写成运行验证通过。
+本次环境没有安装 vLLM 或 GPU runtime，系统 Python 也没有 `pytest` 模块，因此上述测试均未在本机执行；本文对 verl
+实现和测试断言完成了静态核对，不把“存在测试代码”写成“本次运行验证通过”。
 
 ## 13. 当前 AS-IS 的实现边界和多任务复用 GAP
 
@@ -1069,12 +1211,13 @@ verl 仓内已有三组直接证据：
 | 创建 HYBRID manager/replicas/CE | `trainer_base.py:229-367` |
 | 创建 `vLLMHttpServer` Actors并绑定 node/GPU | `vllm_async_server.py:1102-1198` |
 | 创建 `GlobalRequestLoadBalancer` Ray Actor | `llm_server.py:600-611` |
-| 创建 `AgentLoopWorkerTQ` Actors并传入 client | `agent_loop.py:1166-1221` |
-| 提交 prompt 到 TQ | `trainer_base.py:1345-1372` |
-| 创建后台 AgentLoop tasks | `agent_loop_tq.py:52-148` |
+| 创建 `AgentLoopWorkerTQ` Actors并传入 client 普通对象 | `agent_loop.py:1166-1221` |
+| 提交原始 prompt fields 到 TQ | `trainer_base.py:1345-1360` |
+| 创建后台 prompt/session tasks | `agent_loop_tq.py:52-148` |
 | single-turn 调用 client | `single_turn_agent_loop.py:63-76` |
 | client acquire/server/release | `llm_server.py:221-289` |
-| partial merge、预算和重试 | `llm_server.py:345-461` |
+| `TokenOutput` 数据结构 | `replica.py:39-51` |
+| coroutine 内 partial merge、预算和重试 | `llm_server.py:345-461` |
 | ReplayBufferAsync 何时返回 | `replay_buffer.py:497-579` |
 | Trainer abort/sleep hook | `trainer_colocate_async.py:55-59` |
 | CE 遍历 replicas | `checkpoint_engine/base.py:447-465` |
@@ -1087,13 +1230,14 @@ verl 仓内已有三组直接证据：
 | generation resume | `trainer_colocate_async.py:48-53`；`vllm_async_server.py:893-897,1225-1227` |
 | 完整 trajectory 写 TQ | `agent_loop_tq.py:150-227` |
 | 版本跨度 metrics | `trainer_base.py:1805-1831` |
-| TQ checkpoint 后重发 prompt | `trainer_base.py:839-877,938-946` |
+| TQ checkpoint save/load | `trainer_base.py:839-845,938-946` |
+| 从 TQ 取原始 prompt 并重发 | `trainer_base.py:425-432,847-883` |
 
 ## 15. 评审结论
 
 从当前代码可以确认：verl v0.9 的共卡 partial rollout 已经形成一条闭环的**进程内透明续推机制**：Trainer 在完整样本
-足够时全量 pause rollout，客户端保存 partial token 前缀，GPU 转入训练，权重更新后 backend 解除 pause，客户端用
-`prompt+prefix` 重发并最终产出完整 trajectory。
+足够时全量 pause rollout，活 client coroutine frame 保存原始 `prompt_ids` 和 partial token 前缀，GPU 转入训练，
+权重更新后 backend 解除 pause，同一 coroutine 用 `prompt+prefix` 重发并最终产出完整 trajectory。
 
 它最适合被理解为：
 
