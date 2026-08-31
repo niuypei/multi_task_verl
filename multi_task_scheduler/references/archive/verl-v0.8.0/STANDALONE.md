@@ -11,11 +11,11 @@
 >
 > 本文汇总 STANDALONE 模式下的多任务 rollout 资源共享方案。代码事实和下钻分析分别见：
 >
-> - [`03-hybrid-standalone-component-topology.md`](03-hybrid-standalone-component-topology.md)；
-> - [`05-standalone-initialization-process.md`](05-standalone-initialization-process.md)；
-> - [`06-standalone-inference-resource-bubble-detection.md`](06-standalone-inference-resource-bubble-detection.md)；
-> - [`07-async-parameter-sync-checkpoint-engine.md`](07-async-parameter-sync-checkpoint-engine.md)；
-> - [`08-forced-reclaim-request-continuation.md`](08-forced-reclaim-request-continuation.md)；
+> - [`03-hybrid-standalone-component-topology.md`](../../03-hybrid-standalone-component-topology.md)；
+> - [`05-standalone-initialization-process.md`](../../05-standalone-initialization-process.md)；
+> - [`06-standalone-inference-resource-bubble-detection.md`](../../06-standalone-inference-resource-bubble-detection.md)；
+> - [`07-async-parameter-sync-checkpoint-engine.md`](../../07-async-parameter-sync-checkpoint-engine.md)；
+> - [`08-forced-reclaim-request-continuation.md`](../../08-forced-reclaim-request-continuation.md)；
 > - [`STANDALONE-CODE-AUDIT.md`](STANDALONE-CODE-AUDIT.md)：本文所有图、表、流程和技术断言的逐项代码校对矩阵。
 
 本文所有内容使用以下事实层级：

@@ -1,0 +1,363 @@
+# 多任务资源共享调度项目工作进展
+
+> 状态：持续更新。
+>
+> 更新日期：2026-08-31。
+>
+> 本文只记录当前目标、已完成工作、有效结论、未决问题和下一步。长期原则与分析标准见仓库根目录
+> `AGENTS.md`。
+
+## 1. 当前代码与仓库基线
+
+| 项目 | 当前状态 |
+|---|---|
+| 调度仓库 | `/Users/nyp/Documents/multi_task_verl` |
+| 调度仓库分支 | `main` |
+| 已推送 HEAD | `98394b1`，`docs: explain Ray worker binding and deployment views` |
+| 远端 | `git@github.com:niuypei/multi_task_verl.git` |
+| verl 源码 | `/Users/nyp/Documents/verl` |
+| verl 实际 describe | `v0.9.0-1-g88512193` |
+| verl commit | `88512193` |
+| 历史分析基线 | verl `v0.8.0`，已归档到 `references/archive/verl-v0.8.0` |
+| 模拟器 | `/Users/nyp/Documents/multi-rl-task-scheduler` |
+
+本轮已统一归档为参考资料的分析文档：
+
+- `11-training-worker-dict-ray-actor-creation-call-chain.md`；
+- `12-python-class-instance-call-and-rayclasswithinitargs.md`；
+- `14-verl-v0.8-v0.9-hybrid-standalone-differences.md`；
+- `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md`；
+- 本文及 `references/` 目录整理；
+- 仓库根目录 `AGENTS.md`。
+
+正式工作文档为 `multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`；其余分析文档位于
+`multi_task_scheduler/references/`。目录整理提交包含 WIP RFC 的路径重命名，但不额外改写其技术内容。
+当前工作区另有 `.gitignore` 和 Excalidraw 文件，除非用户明确要求，否则不并入分析文档提交。
+
+## 2. 当前项目目标
+
+项目计划以独立子仓方式对接 verl，实现多个 RL 任务之间的 rollout GPU 动态共享，并向社区提交 RFC。
+
+当前阶段目标是：
+
+1. 以 verl v0.9.0 当前代码为准，完整理解 HYBRID 和 STANDALONE 的资源、进程、Actor 和调用链。
+2. 明确 `GroupScheduler`、`TaskRunner`、`MultiTaskLLMServerManager`、LB 和 Checkpoint Engine 的边界。
+3. 识别动态捐赠、借用、回收、参数同步和 partial rollout 所需的原生扩展点与必要改造点。
+4. 先完成代码事实分析和方案评审，再更新正式 RFC，最后进入实现。
+
+当前不以直接实现动态调度为目标，也不在尚未评审时提交侵入式 verl 修改。
+
+## 3. 已确认的总体设计方向
+
+### 3.1 控制关系
+
+```text
+GroupScheduler 1:N TaskRunner
+
+GroupScheduler
+  → 维护全局 task/node/GPU/replica 视图
+  → 生成捐赠、受赠和回收策略
+  → 通过 TaskRunner 下发命令
+
+TaskRunner
+  → 持有 GroupScheduler ActorHandle
+  → 注册、注销和上报任务资源
+  → 在本 controller 进程调用 MultiTaskLLMServerManager
+```
+
+不引入额外通信 Actor。
+
+### 3.2 初始化与共享
+
+- 初始 replica 数量由任务自身配置，GroupScheduler 不参与初始规模分配。
+- 任务启动后将本任务资源注册进 GroupScheduler。
+- 实时资源共享发生在训练运行阶段。
+- donor 原生 replica 不销毁，执行 sleep 后保留，方便回收时唤醒。
+- borrower 根据 GroupScheduler 给出的 node ID、GPU ID 创建临时推理实体。
+- 不能默认复用 donor 的 ResourcePool、Placement Group 和 resource bundle。
+
+### 3.3 三种资源视图
+
+当前设计必须同时维护：
+
+1. verl/Ray 原生资源视图；
+2. 推理 LB server 视图；
+3. GroupScheduler node ID/GPU ID 全局物理视图。
+
+跨任务创建会使三种视图出现差异。GroupScheduler 是跨任务物理资源关系的事实来源，但仍需补充原子更新、失败回滚和
+Ray 原生资源冲突规避方案。
+
+### 3.4 参数同步
+
+- 参数同步时机保持 verl 原生行为，GroupScheduler 不决定同步时间点。
+- GroupScheduler 只调整 Checkpoint Engine 感知的有效 replica 集合。
+- 新 borrower replica 完成明确版本同步后才能加入 LB。
+- 原生 CE 只能覆盖它实际持有 replica/worker handles 的对象，不能从 LB server 列表自动推导覆盖范围。
+- 不能假设使用 donor PG 创建 `BorrowedCheckpointEngineWorker`；该动态 Actor 创建问题仍待 v0.9.0 代码级设计。
+
+## 4. 已完成的研究和文档
+
+### 4.1 v0.8.0 历史研究
+
+以下内容已经完成并归档：
+
+- HYBRID 启动流程和完整 PPO 迭代；
+- 进程、Ray Actor、普通对象和 ActorHandle 拓扑；
+- HYBRID 与 STANDALONE 初始化；
+- Hybrid Engine 与 Colocated deployment 概念区分；
+- one-step async 和 fully async 多种运行模式；
+- partial rollout、陈旧度和 off-policy 控制；
+- Checkpoint Engine 控制面、数据面及 `ServerAdapter`；
+- STANDALONE 推理空泡检测；
+- 强制回收和请求续推；
+- 动态创建 vLLM replica/HTTP server；
+- ResourcePool/PG 与 node ID/GPU ID 直接放置的差异。
+
+归档入口：`multi_task_scheduler/references/archive/verl-v0.8.0/README.md`。
+
+### 4.2 当前参考资料
+
+| 文档 | 内容 | 基线/状态 |
+|---|---|---|
+| `00-project-alignment.md` | 项目背景和需求对齐 | 持续维护 |
+| `01-redesign-scope.md` | 重设计范围和边界 | 持续维护 |
+| `02-group-scheduler-protocol.md` | GroupScheduler 控制协议 | 设计文档 |
+| `03-hybrid-standalone-component-topology.md` | 两种主部署模式组件拓扑 | 待继续按 v0.9 校对 |
+| `04-hybrid-initialization-process.md` | HYBRID 初始化和动态创建 | 主要来自前期研究 |
+| `05-standalone-initialization-process.md` | STANDALONE 初始化和动态创建 | 主要来自前期研究 |
+| `06-standalone-inference-resource-bubble-detection.md` | 异步模式空泡和长尾判断 | 已多轮修正 |
+| `07-async-parameter-sync-checkpoint-engine.md` | 异步参数同步和有效 replica | 已形成核心思路 |
+| `08-forced-reclaim-request-continuation.md` | 强制回收和 partial rollout | 待结合 v0.9 原生能力更新 |
+| `09-ray-worker-group-actor-binding-mechanism.md` | RayWorkerGroup 与 Actor 绑定 | v0.8.0 基线 |
+| `10-training-side-worker-group-business-worker-association.md` | 训练侧 WorkerDict/业务 Worker | v0.8.0 基线 |
+| `11-training-worker-dict-ray-actor-creation-call-chain.md` | v0.9 WorkerDict Actor 完整创建链 | 新增，待评审 |
+| `12-python-class-instance-call-and-rayclasswithinitargs.md` | Python 调用语义和 CIA | 新增，待评审 |
+| `14-verl-v0.8-v0.9-hybrid-standalone-differences.md` | v0.8.0→v0.9.0 两种主部署模式的架构、组件和流程差异 | 新增，待评审 |
+| `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md` | HYBRID + `colocate_async` 的中断、sleep、权重同步、续推和状态归属全链 | 新增，待评审 |
+
+正式 RFC：`multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`。当前 RFC 仍在用户编辑中，更新前先检查工作区差异。
+
+## 5. 最近完成的 v0.9.0 代码结论
+
+### 5.1 共卡 partial rollout
+
+`PPOTrainerColocateAsync` 的当前机制已经确认：
+
+- 使用 `FullyAsyncLLMServerClient`；
+- ReplayBuffer 只向训练侧返回完整 trajectory；
+- 收集够完整样本后，Trainer abort 其他未完成请求并 sleep rollout；
+- vLLM 返回当前 token 前缀和 `stop_reason=aborted`；
+- 客户端协程保存 token、logprob、剩余预算及 min/max global steps；
+- 训练和权重同步完成后，客户端使用原 prompt 加已生成前缀重新 prefill 并续推；
+- KV cache 不需要跨 sleep 保留；
+- 一条 trajectory 可以跨多个模型版本；
+- partial rollout 不表示使用半条 trajectory 更新 PPO。
+
+进一步代码校验已经确认：
+
+- 原生 hook 对 `CheckpointEngineManager.replicas` 全量 abort，不支持只指定一个待回收 replica；
+- partial token、logprob、剩余预算和版本范围保存在 `AgentLoopWorkerTQ` 进程内的 client coroutine，不在
+  TransferQueue、`vLLMReplica` 或 `CheckpointEngineManager`；
+- TQ 只保存 prompt 状态、恢复所需 prompt 数据和最终完整 trajectory；进程故障后的 reissue 会从原 prompt 重生成，
+  不恢复 partial prefix；
+- resume 由 client while-loop 用同一 logical request ID 重新 acquire，并默认以新 backend UUID 提交
+  `prompt + prefix`；`resume_generation_replicas()` 只解除服务端 pause；
+- 当前共卡 hook 不在 abort/sleep 时从 LB 摘除 server，不能直接当成多任务 donor 回收协议；
+- vLLM abort 返回值当前未由 `CheckpointEngineManager` 向 Trainer 传播，multi-node replica 还存在非 head server
+  abort error 被吞掉的实测校验项。
+
+该能力可以作为 GroupScheduler 强制回收的基础，但跨 replica 迁移、持久化和故障恢复仍未由原生机制完整覆盖。
+完整证据链见 `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md`。
+
+### 5.2 STANDALONE `CheckpointEngineWorker`
+
+已确认：
+
+- `RolloutReplica.init_standalone()` 创建独立 ResourcePool 和 `RayWorkerGroup`；
+- `get_ray_class_with_init_args()` 返回包装 `ActorClass(CheckpointEngineWorker)` 的
+  `RayClassWithInitArgs`；
+- `RayWorkerGroup._create_worker()` 调用该包装实例；
+- `RayClassWithInitArgs.__call__()` 最终执行
+  `ActorClass(CheckpointEngineWorker).options(...).remote(...)`；
+- `.remote()` 真正创建 `CheckpointEngineWorker` Ray Actor并返回 ActorHandle；
+- `RayWorkerGroup` 是 controller 普通对象，其 `_workers` 保存 ActorHandle 列表。
+
+### 5.3 训练侧 `WorkerDict`
+
+已确认：
+
+- Trainer 最初对 `ActorRolloutRefWorker`、`DetachActorWorker` 或 critic `TrainingWorker` 调用
+  `ray.remote()`，但此时只得到业务 ActorClass 描述；
+- `create_colocated_worker_cls()` 将业务 ActorClass 和构造参数收集进闭包；
+- 函数动态定义 `WorkerDict`，并在其 `__init__()` 中解包业务 ActorClass 后普通构造业务对象；
+- `ray.remote(WorkerDict)` 生成外层 ActorClass；
+- 传给训练侧 `RayWorkerGroup` 的是包装 `ActorClass(WorkerDict)` 的第二层
+  `RayClassWithInitArgs`；
+- 最终通过 `.remote()` 创建的实际 Ray Actor 是 `WorkerDict`；
+- `ActorRolloutRefWorker`、`DetachActorWorker` 和 critic `TrainingWorker` 是
+  `WorkerDict` Actor 进程内普通对象；
+- `spawn()` 只生成引用同一组 ActorHandle 的角色级 `RayWorkerGroup` 代理，不创建新 Actor。
+
+### 5.4 `_bind_workers_method_to_parent()`
+
+已确认该函数实现：
+
+- 只扫描带 verl `@register`/`MAGIC_ATTR` 的业务接口；
+- 在 `WorkerDict` 上生成委托到 `self.worker_dict[key]` 的代理方法；
+- 默认使用 `<role>_<method>` 前缀避免 actor/critic 同名接口冲突；
+- 复制 dispatch、collect、blocking 等调用元数据；
+- 在 `ray.remote(WorkerDict)` 前完成绑定，使 ActorHandle 能暴露对应远端方法；
+- 配合 `spawn()` 向 Trainer 提供无前缀的角色级透明调用视图。
+
+### 5.5 Python 类调用和实例调用
+
+已确认：
+
+```text
+RayClassWithInitArgs(...)
+  → 调用类对象
+  → type.__call__
+  → __new__ + __init__
+  → 返回 RayClassWithInitArgs 实例
+
+ray_cls_with_init(...)
+  → 调用上述实例
+  → RayClassWithInitArgs.__call__
+  → ActorClass.remote()
+  → 返回 ActorHandle
+```
+
+该结论用于避免把 `replica.py:234` 的类构造误判为实例 `__call__()`。
+
+### 5.6 v0.8.0 到 v0.9.0 的部署和 Trainer 架构差异
+
+已基于精确 tag `v0.8.0@7aed6b23` 与 `v0.9.0@483b8a00` 完成对照，确认：
+
+- `RolloutMode.HYBRID/STANDALONE` 的定义和 `RolloutReplica` 基本初始化路径没有本质变化；
+- v0.9.0 把 `main_ppo_sync.py` 重构为 V1 `PPOTrainer` 抽象基类，并新增 `PPOTrainerSync`、
+  `PPOTrainerColocateAsync`、`PPOTrainerSeparateAsync`；
+- v0.9.0 默认 `trainer.use_v1=true`，但 `use_v1=false` 仍可进入
+  `main_ppo_v0.TaskRunner + RayPPOTrainer` 兼容链；当前多任务分析以 V1 为目标主链；
+- `trainer_mode=colocate_async` 仍使用 HYBRID rollout 资源组织，不等于 `RolloutMode.COLOCATED`；
+- v0.9.0 共卡模式新增基于 abort/sleep/resume 和 `FullyAsyncLLMServerClient` 的 partial rollout；
+- V1 separate 在一个 TaskRunnerV1 进程中持有 hybrid/standalone 两套 `LLMServerManager` 和两套
+  `CheckpointEngineManager`，不再采用 V0.8 experimental 的 Trainer/Rollouter/MessageQueue 三控制 Actor 主链；
+- V1 separate 的常规 HYBRID 再激活判断 `should_switch_to_rollout()` 当前固定返回 `False`，完整策略仍是 GAP；
+- v0.9.0 experimental 新增 `DynamicResourceController`，但它只实现单任务内部 HYBRID/STANDALONE 切换，
+  不能替代跨任务 GroupScheduler；
+- v0.9.0 已提供 LB add/remove、partial retry、CE replica add/remove 等可复用执行原语，但动态 borrower
+  Worker/replica 的跨任务物理创建仍未解决。
+
+详细证据和流程见 `14-verl-v0.8-v0.9-hybrid-standalone-differences.md`。
+
+## 6. 当前未决问题
+
+### 6.1 动态 borrower rollout 的 Actor 创建
+
+需要基于 v0.9.0 继续明确：
+
+- 不复用 donor ResourcePool/PG/bundle 时，如何创建 borrower 的 `CheckpointEngineWorker` Ray Actor；
+- 是否复用 `RayClassWithInitArgs(sharing_with=...)` 分支；
+- 是否需要直接使用 NodeAffinity、显式 CUDA visible devices 和定制 Ray options；
+- 新 Actor 如何与 donor sleep 的 vLLM 进程共享同一物理 GPU而不被 Ray 原生资源调度冲突；
+- 谁持有新 ActorHandle，如何组装 `RolloutReplica.workers`。
+
+### 6.2 动态 vLLM replica 和 HTTP server
+
+需要明确完整创建和回收顺序：
+
+```text
+选择 donor GPU
+→ donor server 移出 LB
+→ abort/drain
+→ donor sleep
+→ 创建 borrower CheckpointEngineWorker/ServerAdapter
+→ 创建 vLLMHttpServer
+→ 启动 vLLM WorkerProc
+→ 同步明确版本权重
+→ 更新 CE/manager/LB 有效集合
+```
+
+还需要定义任何一步失败后的回滚顺序。
+
+### 6.3 v0.9 partial rollout 与强制回收的复用边界
+
+原生行为已经确认：
+
+- Trainer hook 全量 abort manager 中的 replicas；
+- client coroutine 持有可重发的 token prefix，LB server 被移除时能够重选，但原生 hook 不执行摘流或跨任务迁移；
+- partial prefix 没有持久化到 TransferQueue；
+- logical request ID 用于 LB sticky，backend vLLM ID 默认每个 attempt 新建；
+- abort 结果、TQ uid 与 backend request ID 之间没有供调度器使用的闭环映射。
+
+仍需设计和评审：
+
+- per-replica targeting 与 LB 两阶段摘流；
+- 是否以及如何持久化 partial token、logprob 和版本状态；
+- borrower 版本门禁、请求唯一所有权和幂等重试；
+- 如何避免请求重复完成、丢失或被两个实例同时续推；
+- multi-node replica 的 abort/pause 广播和错误处理。
+
+### 6.4 参数同步有效集合
+
+需要明确：
+
+- 动态 add/remove replica 与 `CheckpointEngineManager.update_weights()` 是否并发；
+- `replicas` 列表和临时 rollout `RayWorkerGroup` 的一致性；
+- 正在同步时能否回收；
+- 新增实例首次同步失败时是否允许进入 LB；
+- donor 唤醒时如何恢复其原任务版本；
+- 跨任务模型、tokenizer 或并行配置不兼容时如何拒绝共享。
+
+### 6.5 三种视图的一致性协议
+
+尚需形成状态机，覆盖：
+
+```text
+ACTIVE_DONOR
+→ DRAINING
+→ SLEEPING
+→ DONATED
+→ BORROWER_CREATING
+→ BORROWER_SYNCING
+→ BORROWER_ACTIVE
+→ RECLAIMING
+→ DONOR_WAKING
+→ ACTIVE_DONOR
+```
+
+每个状态需要定义原生 ResourcePool 视图、LB 视图和 GroupScheduler 视图，并规定失败回滚目标。
+
+### 6.6 文档版本迁移
+
+- `09`、`10` 仍是 v0.8.0 基线，应决定是归档还是按 v0.9.0 全量重写。
+- `03`、`04`、`05`、`06`、`07`、`08` 需要逐步按 v0.9.0 重新校对代码和行号。
+- v0.8.0→v0.9.0 的总体差异已落入独立文档 `14`，共卡 partial rollout 全链已落入独立文档 `15`，但尚未
+  回写上述主文档。
+- 正式 RFC 应在上述关键问题评审后更新，避免把未确认设计写成定论。
+
+## 7. 下一步建议顺序
+
+推荐按以下顺序继续：
+
+1. 分析 STANDALONE 动态 borrower `CheckpointEngineWorker` 的无 PG 创建路径。
+2. 追踪 `vLLMReplica.launch_servers()` 如何利用 worker node ID/GPU ID 创建 `vLLMHttpServer`，判断哪些代码可复用。
+3. 形成 donor/borrower 创建、同步、加入 LB、回收的 v0.9.0 完整 AS-IS/TO-BE 对照时序。
+4. 基于文档 `15` 已确认的原生边界，设计 per-replica 摘流、请求唯一所有权和跨 replica continuation 协议。
+5. 定义三种视图的状态机、锁和失败回滚规则。
+6. 经用户评审后更新 `07`、`08` 和正式 RFC。
+7. 完成文档评审后更新正式 RFC；需要远端同步时再推送当前提交。
+
+## 8. 进度维护规则
+
+后续每完成一个实质阶段，更新：
+
+- 当前代码基线；
+- 新增或修改的文档；
+- 已确认结论；
+- 被推翻或修正的历史结论；
+- 新增未决问题；
+- 推荐下一步；
+- Git 提交和推送状态。
+
+长期分析原则和用户已确认的稳定约束写入根目录 `AGENTS.md`；易变化的实现进度只写入本文。
