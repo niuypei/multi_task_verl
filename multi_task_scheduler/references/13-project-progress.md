@@ -13,8 +13,8 @@
 |---|---|
 | 调度仓库 | `/Users/nyp/Documents/multi_task_verl` |
 | 调度仓库分支 | `main` |
-| 当前本地 HEAD | `54df441`，`docs: fix partial rollout diagrams and resume analysis` |
-| 已推送 HEAD | `54df441`，`docs: fix partial rollout diagrams and resume analysis` |
+| 本轮开始时本地 HEAD | `a4e058c`，`docs: split RFC workflows and refresh project context` |
+| 本轮已先推送基线 | `a4e058c`，`origin/main` 已同步 |
 | 远端 | `git@github.com:niuypei/multi_task_verl.git` |
 | verl 源码 | `/Users/nyp/Documents/verl` |
 | verl 实际 describe | `v0.9.0-1-g88512193` |
@@ -33,9 +33,13 @@
 - 本文及 `references/` 目录整理；
 - 仓库根目录 `AGENTS.md`。
 
-正式工作文档为 `multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`；其余分析文档位于
-`multi_task_scheduler/references/`。目录整理提交包含 WIP RFC 的路径重命名，但不额外改写其技术内容。
-当前工作区另有 `.gitignore` 和 Excalidraw 文件，除非用户明确要求，否则不并入分析文档提交。
+正式工作文档已拆分为：
+
+- `multi_task_scheduler/多RL任务资源共享调度对接VERL - 架构及组件.md`；
+- `multi_task_scheduler/[WIP] 多RL任务资源共享调度对接VERL - 关键流程.md`。
+
+其余分析文档位于 `multi_task_scheduler/references/`。本轮不修改上述正式文档。工作区中的本地 Mermaid CLI 环境和
+Excalidraw 草稿属于工具或未定稿资料，除非用户明确要求，否则不提交。
 
 ## 2. 当前项目目标
 
@@ -95,13 +99,20 @@ Ray 原生资源冲突规避方案。
 
 ### 3.4 参数同步
 
-- 参数同步时机保持 verl 原生行为，GroupScheduler 不决定同步时间点。
-- GroupScheduler 不持有 replica/worker/adapter runtime handles，也不直接调整 Checkpoint Engine；它通过 borrower
-  `TaskRunner` 下发规模命令，由 borrower 任务更新 Checkpoint Engine 感知的有效 replica 集合。
-- 新 borrower replica 完成明确版本同步后才能加入 LB。
+- 新 replica 的 `BOOTSTRAPPING` 与 verl 原生参数同步是两个独立操作：bootstrap 由 runtime-ready 事件触发，只把该 replica
+  追平到任务当前已发布的 serving version；原生同步仍按 verl 原有 hook/频率发布下一版本并更新全部 effective replica。
+- 两者的数据面必须经 task-local weight-version gate 串行。bootstrap 已开始时，原生同步请求可按原时机到达并 pending，但
+  snapshot cut、process-group 构建和传权必须等 bootstrap 完成 CE effective membership 与 LB `ROUTABLE` 提交或失败回滚。
+- bootstrap 不递增任务参数版本、不 reset staleness、不 abort 或重复同步已有 replica；其数据源必须是不可变的
+  `PublishedWeightSnapshot(V_serving)`，不能把可能已经领先的 trainer live weights 标成当前 serving version。
+- 新 borrower replica 完成 bootstrap、进入 CE effective membership 并通过最终 LB commit 后才能接流；gate 释放后的下一次
+  原生 sync snapshot 必须包含它。
+- GroupScheduler 不持有 replica/worker/adapter runtime handles，也不调用 Checkpoint Engine 或改变原生 hook；它只通过 borrower
+  `TaskRunner` 下发规模命令，由 borrower 任务执行 bootstrap、更新有效集合和提交路由状态。
 - 原生 CE 只能覆盖它实际持有 replica/worker handles 的对象，不能从 LB server 列表自动推导覆盖范围。
 - borrowed replica 的同步 endpoint 必须由 borrower 创建并拥有，不能重绑定或临时复用 donor
   `CheckpointEngineWorker`/`ServerAdapter`。
+- 当前 CE 没有 target-only bootstrap + 指定已发布版本重放接口，HYBRID naive 也只覆盖固定 `actor_wg`；两者都是 GAP。
 - 不能假设使用 donor PG 创建 `BorrowedCheckpointEngineWorker`；该动态 Actor 创建问题仍待 v0.9.0 代码级设计。
 
 ## 4. 已完成的研究和文档
@@ -146,7 +157,8 @@ Ray 原生资源冲突规避方案。
 | `16-verl-v0.9-dynamic-replica-view-and-reference-audit.md` | HYBRID/STANDALONE 动态 replica 的引用、视图、发布事务和 GAP | 新增，待评审 |
 | `17-verl-v0.9-dynamic-replica-scaling-timing-and-mutual-exclusion.md` | STANDALONE Fully Async、HYBRID partial、HYBRID 同步三种主链的扩缩容时机、CE snapshot、LB drain 和 phase gate | 已按场景全量重构，待评审 |
 
-正式 RFC：`multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`。当前 RFC 仍在用户编辑中，更新前先检查工作区差异。
+正式工作文档：`multi_task_scheduler/多RL任务资源共享调度对接VERL - 架构及组件.md` 与
+`multi_task_scheduler/[WIP] 多RL任务资源共享调度对接VERL - 关键流程.md`。当前文档仍在用户评审中，更新前先检查工作区差异。
 
 ## 5. 最近完成的 v0.9.0 代码结论
 
@@ -305,36 +317,46 @@ ray_cls_with_init(...)
 - HYBRID + partial 以 `PPOTrainerColocateAsync` 的 dispatch、`ReplayBufferAsync.sample()`、abort/sleep、training、step-end
   sync/resume 为完整 step；
 - HYBRID + 同步以 `PPOTrainerSync` 的自然 drain/sleep、training、step-end sync 为完整 step；
-- 三种模式均分别给出了 CREATE、CE ADD、LB ADD、LB REMOVE、CE REMOVE、DESTROY 的阶段矩阵、版本例子和失败/延期条件；
+- 三种模式均分别给出了 CREATE、target-only BOOTSTRAP、CE EFFECTIVE COMMIT、LB ROUTABLE COMMIT、LB REMOVE、
+  CE REMOVE、DESTROY 的阶段矩阵、版本例子和失败/延期条件；
+- 最新确认：BOOTSTRAPPING 只把 new replica 更新到当前 `V_serving`，不递增任务参数版本、不 reset 全局 staleness、
+  不 abort 或重复传输已有 replica；verl 原生参数同步才发布 `V_next` 并更新全部 effective replica；
+- bootstrap 与原生同步的业务触发相互独立，但数据面共享 task-local weight-version gate。从 pin 已发布版本开始，直到
+  CE effective membership 与 LB `ROUTABLE` 提交或失败回滚，原生 sync 请求可以 pending、不能开始 snapshot/传权；
+- 如果 native sync 先获得 gate，新 replica 等它完成后只 bootstrap 最新 serving version；如果 bootstrap 先获得 gate，native
+  sync 随后冻结包含 new replica 的 effective snapshot。三种模式都不再要求 new replica 等下一原生同步周期才能接流；
+- bootstrap 数据源不能直接使用 trainer live weights，因为 Fully Async 中 trainer 可能已领先 serving replica；当前需要一个
+  可 pin 的不可变 `PublishedWeightSnapshot(V)`，而现有 manager 主链没有 target-only 版本重放接口；
 - Fully Async 的 canonical manager 位于 `FullyAsyncRollouter` Actor，CE 位于 `FullyAsyncTrainer` Actor 并持有 replica
-  序列化副本，动态伸缩必须做跨 Actor 两阶段提交并同步更新 `max_concurrent_samples`；
+  序列化副本，动态伸缩必须做跨 Actor 提交；容量先 prepare，LB `ROUTABLE` commit 是最终路由可见线性化点；
 - Fully Async 强制回收只有在 `async_training.partial_rollout=True` 时才能复用 prefix retry；关闭时按自然 drain 处理；
 - HYBRID partial 可在 LB 摘流后复用 target abort 和 client coroutine 中的 prefix 续推；partial prefix 不在 TransferQueue；
 - HYBRID 同步没有 transparent partial retry，deadline 小于剩余请求时间时必须 defer/reject，不能强杀后声称样本可续推；
 - HYBRID naive CE 只调用固定 `actor_wg.update_weights()`，简单向 `self.replicas` 增加 true-new borrower replica 不会同步
-  外部 endpoint；这是两种 HYBRID 场景共同的关键 GAP；
-- “scaling 与参数同步互斥”只应覆盖 sync snapshot cut、版本发布和被 pin 实体销毁；lease reserve、hidden
-  materialize、LB begin-drain 可以按条件并行，不能把整个事务放进一把长持有全局锁；
+  外部 endpoint；两种 HYBRID 场景都需要“target-only external bootstrap + 后续 native fixed/borrowed subsets 联合发布”；
+- CREATE、lease reserve 和 LB begin-drain 不需要持有 weight-version gate；ADD 从版本 pin 到 `ROUTABLE` 的区间必须与原生 sync
+  数据面互斥。remove 仍通过 membership snapshot、lifecycle gate 和 pin 收敛，不从 begin-drain 起持有同一把长锁；
 - `CheckpointEngineManager.update_weights()` 当前从 abort、worker flatten、KV lifecycle 到 resume 多次读取可变
   `self.replicas`，开放 TaskRunner 并发控制后会产生成员漂移；一次 sync 必须冻结 immutable tuple，并用 sync/lifecycle
   refcount 保护销毁；
 - 当前 `GlobalRequestLoadBalancer.remove_servers()` 会立即删除 inflight counter，后到的 fire-and-forget release 被忽略；
   安全回收需要 `begin_drain/finish_remove` 两阶段协议，同时验证 LB inflight 和 backend queued/running；
 - `TaskRunnerV1` 和 `FullyAsyncTaskRunner` 都以同步长方法占用各自 Ray Actor；运行期间新增普通 actor method 不可达；
-  子仓 TaskRunner 需要 control concurrency group，控制 RPC 只验 fence/入队。HYBRID 由 Trainer phase hook 串行 reconcile，
-  Fully Async 则通过既有 Trainer/Rollouter ActorHandle 做跨 Actor 两阶段提交，不能并发修改 Trainer/CE/manager 裸 list；
+  子仓 TaskRunner 需要 control concurrency group，控制入口先验 fence/入队。HYBRID 由 Trainer phase hook 串行 reconcile；若要让
+  external bootstrap 与 H2/S2 训练重叠，可由 phase entry 启动 TaskRunner 进程内受 gate 保护的 lifecycle job，但不得并发修改
+  Trainer/CE/manager 裸 list。Fully Async 则通过既有 Trainer/Rollouter ActorHandle 做跨 Actor 提交；
 - HYBRID 可借窗口位于 rollout tail，所有 borrowed runtime 必须在 donor `on_sample_end()` 返回、进入 actor training 前
   完成回收和 HBM 释放；`PPOTrainerSync` 只能自然 drain，`PPOTrainerColocateAsync` 可以复用 partial retry 强制中断；
 - STANDALONE lease 可以跨 donor training 阶段，但 dormant native replica 必须从所有与 lease window 重叠的 donor CE
-  snapshots 排除；回收后需等待 donor 自己的下一次原生 sync 才能重新进 donor LB；
-- 在“GroupScheduler 不改变 verl 原生参数同步时机”前提下，真正运行期新建的 replica 不能帮助已经选入当前 training batch 的
-  样本；它必须等 borrower 下一次原生 sync。partial 场景中，发布后可承接上一版本被中断的 continuation；若要求在原生 sync
-  之前即时接流，仍需另行选择预同步 dormant replica 或版本化即时装载方案；
+  snapshots 排除；资源归还后，donor dormant replica 同样先 target-only bootstrap 到 donor 当前 serving version，再恢复
+  CE effective/LB `ROUTABLE`；
+- GroupScheduler 不改变原生 sync hook 或发布版本，但 bootstrap gate 可以延迟该 hook 的数据面执行。GroupScheduler 只提交
+  scale command/lease，不直接调用 CE，也不参与权重版本选择；
 - validation 默认冻结 scaling membership；checkpoint save 不直接遍历 rollout replica，不需要与所有 prepare/drain 操作
-  粗粒度互斥，但仍受 HYBRID phase gate 和 task session fencing 约束；
-- 文档中的 8 个 Mermaid 图已使用本地 Mermaid CLI 11.16.0 全量实际渲染成功。
+  粗粒度互斥，但 effective/LB commit 仍受 validation topology gate 和 task session fencing 约束。
+- 文档中的 8 个 Mermaid 图已使用本地 Mermaid CLI 11.16.0 全量实际渲染成功；本轮未运行或修改 verl。
 
-本轮仍未修改正式 WIP RFC，以上结论等待用户评审。
+本轮仍未修改正式架构/流程文档，以上结论等待用户评审。
 
 ## 6. 当前未决问题
 
@@ -365,9 +387,11 @@ ray_cls_with_init(...)
 → borrower manager 创建并登记自己的 vLLMHttpServer/backend
 → 创建或绑定 borrower-owned sync endpoint
 → 启动 vLLM WorkerProc
-→ 同步明确版本权重
-→ 更新 borrower CE effective snapshot
-→ 最后发布 borrower head server 到 borrower LB
+→ 获取 weight-version gate 并 pin 当前 PublishedWeightSnapshot(V_serving)
+→ 只向 new replica 执行 target-only bootstrap
+→ 在 gate 内更新 borrower CE effective membership
+→ 最后提交 borrower head server 为 LB ROUTABLE
+→ 释放 gate；后续原生 sync snapshot 必须包含 new replica
 → GroupScheduler commit lease ACTIVE
 ```
 
@@ -395,23 +419,27 @@ ray_cls_with_init(...)
 
 文档 `17` 已明确时间和互斥原则：
 
-- desired membership 可在 sync 期间记录，但当前 epoch 使用 immutable snapshot；
+- bootstrap 与原生 sync 的触发相互独立，但实际 snapshot/传权共享 task-local weight-version gate；
+- new replica runtime ready 后立即只同步当前 `V_serving`，不等待下一原生同步周期，也不更新已有 replica；
+- desired membership 可在 sync 期间记录，但当前 native epoch 使用 immutable effective snapshot；
 - 已被 snapshot pin 的 replica 可以先进入 DRAINING，不能销毁；
-- 新增实例首次同步失败时保持 hidden，不能进入 LB；
-- donor native replica 回收后必须在 donor 原生 sync 获得当前版本后才能重新进 LB；
-- GroupScheduler 不直接触发权重同步。
+- 新增实例 bootstrap、CE effective commit 或 LB commit 失败时保持 hidden/failed，回滚 effective membership 并释放 gate；
+- donor native replica 归还后也先 target-only bootstrap donor 当前 serving version，再恢复 CE effective/LB；
+- GroupScheduler 的 ADD 命令可以启动 task-local bootstrap 事务，但 GroupScheduler 不直接执行 bootstrap/原生同步数据面，
+  也不选择或发布权重版本；它只下发规模命令和物理 lease。
 
 仍需明确：
 
-- immutable snapshot/pin 的具体 API 和异常恢复；
+- immutable native snapshot/pin、weight-version gate/block token 的具体 API 和异常恢复；
+- `PublishedWeightSnapshot(V)` 的生成、保留、pin/unpin 与 target-only replay 接口；
 - 跨任务模型、tokenizer、backend 和并行配置不兼容时如何在 lease 前拒绝共享；
-- sync receipt 的数据结构、版本校验和 LB publish 超时补偿。
+- bootstrap/native sync receipt 的数据结构、版本校验和 LB publish 超时补偿。
 
 还需分别解决：
 
-- HYBRID 真正新建 replica 的动态 ServerAdapter/权重 endpoint；
-- STANDALONE borrowed replica 的 borrower-owned receiver endpoint 创建；
-- 一次 sync 从 worker 展平到 finalize 全程使用同一个不可变 replica snapshot。
+- HYBRID 真正新建 replica 的 dynamic ServerAdapter/权重 endpoint，以及 native fixed/borrowed subsets 的联合发布；
+- STANDALONE borrowed replica 的 borrower-owned target receiver endpoint 创建；
+- 一次 native sync 从 worker 展平到 finalize 全程使用同一个不可变 effective snapshot。
 
 ### 6.5 三种视图的一致性协议
 
@@ -423,7 +451,8 @@ ACTIVE_DONOR
 → SLEEPING
 → DONATED
 → BORROWER_CREATING
-→ BORROWER_SYNCING
+→ BORROWER_BOOTSTRAPPING
+→ BORROWER_CE_EFFECTIVE
 → BORROWER_ACTIVE
 → RECLAIMING
 → DONOR_WAKING
@@ -445,12 +474,13 @@ ACTIVE_DONOR
 推荐按以下顺序继续：
 
 1. 联合评审文档 `16` 的 M/C/L/G 视图边界与文档 `17` 的 phase/snapshot gate，先确认原子性和时间语义。
-2. 确认“真正新建 replica 等下一原生 sync 生效”是否满足实时扩容目标；若不满足，单独评审预同步/即时版本装载方案。
-3. 设计 CE immutable snapshot/pin 与 LB `begin_drain/finish_remove` 的最小 API，并先做并发测试。
+2. 设计 `PublishedWeightSnapshot(V)` 与 target-only `bootstrap_replica()` 接口，明确版本保留、pin、失败恢复和资源开销。
+3. 设计 weight-version gate、CE immutable effective snapshot/pin 与 LB `begin_drain/finish_remove/commit_routable` 的最小 API，
+   并覆盖 native-sync-first、bootstrap-first、超时和取消四类并发测试。
 4. 选择 HYBRID borrowed replica 的动态权重 endpoint 方案，不能继续把 `CE.add_replicas()` 当作完整答案。
-5. 设计并验证 STANDALONE 的真实 HBM release，以及 borrower CE/ServerAdapter endpoint 创建方案。
+5. 设计并验证 STANDALONE 的真实 HBM release，以及 borrower CE/ServerAdapter target endpoint 创建方案。
 6. 基于文档 `15` 的原生边界，设计 per-replica 摘流、请求唯一所有权和跨 replica continuation 协议。
-7. 经用户评审后再更新 `07`、`08` 和正式 RFC；当前不改 WIP RFC。
+7. 经用户评审后再更新 `07`、`08` 和正式架构/流程文档；当前不修改它们。
 
 ## 8. 进度维护规则
 

@@ -66,7 +66,15 @@
 
 ### 3.3 参数同步
 
-- `GroupScheduler` 不改变 verl 原生参数同步时机。
+- 必须区分新 replica 的 `BOOTSTRAPPING` 与 verl 原生参数同步：bootstrap 是事件驱动的 target-only 追平操作，只把新
+  replica 同步到 borrower 当前已发布的 serving version；原生参数同步才发布 next version 并更新全部 effective replica。
+- `GroupScheduler` 不改变 verl 原生参数同步的 hook 和触发条件。若 bootstrap 已经开始，原生同步请求可以按原时机到达并进入
+  pending，但 snapshot cut、process-group 构建和传权必须等待 bootstrap 完成 CE effective membership 与 LB `ROUTABLE`
+  提交或失败回滚。
+- bootstrap 不递增任务参数版本、不 reset 全局 staleness、不 abort 已有 replica，也不让已有 replica 重复参与传输。
+- bootstrap 必须读取不可变的当前已发布权重版本；不得把可能已经领先的 trainer live weights 标成当前 serving version。
+- 新 replica 成为 `ROUTABLE` 前必须已经进入 CE effective membership；释放 bootstrap/native gate 后，下一次原生同步 snapshot
+  必须包含该 replica，并与其他 effective replica 一起更新。
 - `GroupScheduler` 不持有 replica/worker/adapter runtime handles，也不直接调用参数同步组件；它通过目标任务的
   `TaskRunner` 下发规模命令，由 borrower 任务更新参数同步组件当前感知的有效 replica 集合。
 - 有效集合应表达本任务固有 replica、当前受赠 replica、已捐出 replica 和正在回收 replica 的状态变化。
@@ -76,6 +84,8 @@
 - 不得虚构 verl 已有 `BorrowedCheckpointEngineWorker` 类。TO-BE 新类必须明确标注为 Proposed，并说明创建方式。
 - borrowed replica 的同步 receiver/`ServerAdapter` endpoint 必须由 borrower 创建并拥有；不得通过重绑定或临时使用
   donor `CheckpointEngineWorker`/`ServerAdapter` 解决。
+- bootstrap 超时、receiver 失败或 LB ADD 失败时，必须保持新 replica 不可路由，回滚 CE effective membership 并释放 gate；
+  动态扩容失败不得永久阻塞 verl 原生参数同步。
 - 当前阶段优先分析 Checkpoint Engine 固有能力；除非用户重新要求，否则不要默认依赖 Mooncake/DDR offload 解决同步。
 
 ### 3.4 partial rollout 与回收
@@ -201,8 +211,9 @@
 
 ## 8. 文档维护标准
 
-- `multi_task_scheduler/references/` 统一存放 RFC 的分析与调研参考资料；正式工作文档保留为
-  `multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`。
+- `multi_task_scheduler/references/` 统一存放 RFC 的分析与调研参考资料；正式工作文档当前拆分为
+  `multi_task_scheduler/多RL任务资源共享调度对接VERL - 架构及组件.md` 与
+  `multi_task_scheduler/[WIP] 多RL任务资源共享调度对接VERL - 关键流程.md`。
 - `multi_task_scheduler/references/archive/verl-v0.8.0` 是历史归档，除非用户明确要求，不修改其事实基线。
 - v0.9.0 新分析优先新建独立文档，评审通过后再合并到 RFC。
 - 每份文档开头标明状态，如“待评审”“已确认”“历史归档”。
