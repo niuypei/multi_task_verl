@@ -55,18 +55,27 @@
 - donor 原生推理实例不销毁，只执行 abort/drain、从活跃视图移除和 sleep，便于随时唤醒。
 - borrower 的临时推理实例可以在回收时销毁或按后续设计处理，但不能错误地销毁 donor 原生实例。
 - 动态 borrower 实例不能默认复用 donor 的 `RayResourcePool`、Placement Group 或 resource bundle。
+- borrowed replica 仅根据 `GroupScheduler` 租约中的 immutable node ID/GPU IDs 创建；不把 donor 的
+  ResourcePool、PG、bundle、`RayWorkerGroup`、worker、`CheckpointEngineWorker`、`ServerAdapter` 或 server handle
+  传给 borrower。
+- borrowed replica 从创建开始完全归 borrower 任务所有。borrower 的 `MultiTaskLLMServerManager` 持有完整运行时和
+  生命周期引用；borrower 的同步组件和 LB 分别持有自己的同步 endpoint 与 head server 引用；donor 只管理自己的
+  native sleeping replica，不登记 borrowed replica。
 - 如果绕过 verl 原生资源分配视图并按 node ID、GPU ID、NodeAffinity 和显式可见设备创建实例，真实 GPU 排他性和
   生命周期必须由 `GroupScheduler` 维护。
 
 ### 3.3 参数同步
 
 - `GroupScheduler` 不改变 verl 原生参数同步时机。
-- `GroupScheduler` 只调整参数同步组件当前感知的有效 replica 集合。
+- `GroupScheduler` 不持有 replica/worker/adapter runtime handles，也不直接调用参数同步组件；它通过目标任务的
+  `TaskRunner` 下发规模命令，由 borrower 任务更新参数同步组件当前感知的有效 replica 集合。
 - 有效集合应表达本任务固有 replica、当前受赠 replica、已捐出 replica 和正在回收 replica 的状态变化。
 - 新实例必须完成明确版本的权重同步后才能进入 LB 接收请求。
 - 不得假定原生 `CheckpointEngineManager` 自动覆盖 LB 中所有 server；必须从其实际 `replicas`、
   `replica.workers` 和 ActorHandle 调用路径证明覆盖范围。
 - 不得虚构 verl 已有 `BorrowedCheckpointEngineWorker` 类。TO-BE 新类必须明确标注为 Proposed，并说明创建方式。
+- borrowed replica 的同步 receiver/`ServerAdapter` endpoint 必须由 borrower 创建并拥有；不得通过重绑定或临时使用
+  donor `CheckpointEngineWorker`/`ServerAdapter` 解决。
 - 当前阶段优先分析 Checkpoint Engine 固有能力；除非用户重新要求，否则不要默认依赖 Mooncake/DDR offload 解决同步。
 
 ### 3.4 partial rollout 与回收
@@ -169,6 +178,9 @@
 1. verl/Ray 原生资源视图：`RayResourcePool`、Placement Group、bundle、`RayWorkerGroup`。
 2. 推理 LB 视图：server address、`vLLMHttpServer` ActorHandle、路由缓存和请求负载。
 3. `GroupScheduler` 全局物理视图：task、replica、node ID、GPU ID、donor/borrower 和生命周期状态。
+
+除此之外，动态 replica 必须单独分析 borrower 任务内的 manager ownership/lifecycle registry 和 Checkpoint Engine
+同步投影。LB、同步投影与 manager registry 不能互相替代或自动推导。
 
 如果三种视图不一致，必须说明：
 

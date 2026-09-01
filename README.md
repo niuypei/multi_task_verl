@@ -4,7 +4,7 @@
 
 ## 当前工作入口
 
-- [【WIP】多RL任务资源共享调度RFC.md](multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md)：唯一保留在设计目录顶层的正式工作文档；
+- [多RL任务资源共享调度对接VERL - 架构及组件.md](multi_task_scheduler/多RL任务资源共享调度对接VERL%20-%20架构及组件.md)：设计目录顶层的架构与组件工作文档；
 - [参考资料索引](multi_task_scheduler/references/README.md)：历次代码调研、架构分析、设计推演和历史归档；
 - [长期分析规则](AGENTS.md)：代码证据、版本、实体命名、图示和工作区维护标准。
 

@@ -2,7 +2,7 @@
 
 > 状态：持续更新。
 >
-> 更新日期：2026-08-31。
+> 更新日期：2026-09-01。
 >
 > 本文只记录当前目标、已完成工作、有效结论、未决问题和下一步。长期原则与分析标准见仓库根目录
 > `AGENTS.md`。
@@ -13,8 +13,8 @@
 |---|---|
 | 调度仓库 | `/Users/nyp/Documents/multi_task_verl` |
 | 调度仓库分支 | `main` |
-| 当前本地 HEAD | `6dba0d4`，`docs: organize RFC reference materials` |
-| 已推送 HEAD | `98394b1`，`docs: explain Ray worker binding and deployment views` |
+| 当前本地 HEAD | `54df441`，`docs: fix partial rollout diagrams and resume analysis` |
+| 已推送 HEAD | `54df441`，`docs: fix partial rollout diagrams and resume analysis` |
 | 远端 | `git@github.com:niuypei/multi_task_verl.git` |
 | verl 源码 | `/Users/nyp/Documents/verl` |
 | verl 实际 describe | `v0.9.0-1-g88512193` |
@@ -28,6 +28,8 @@
 - `12-python-class-instance-call-and-rayclasswithinitargs.md`；
 - `14-verl-v0.8-v0.9-hybrid-standalone-differences.md`；
 - `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md`；
+- `16-verl-v0.9-dynamic-replica-view-and-reference-audit.md`；
+- `17-verl-v0.9-dynamic-replica-scaling-timing-and-mutual-exclusion.md`；
 - 本文及 `references/` 目录整理；
 - 仓库根目录 `AGENTS.md`。
 
@@ -76,6 +78,9 @@ TaskRunner
 - donor 原生 replica 不销毁，执行 sleep 后保留，方便回收时唤醒。
 - borrower 根据 GroupScheduler 给出的 node ID、GPU ID 创建临时推理实体。
 - 不能默认复用 donor 的 ResourcePool、Placement Group 和 resource bundle。
+- 最新确认：donor 不向 borrower 传递或临时出借 ResourcePool、PG、bundle、RayWorkerGroup、worker、
+  `CheckpointEngineWorker`、`ServerAdapter` 或 server handle。borrowed replica 从创建开始完全由 borrower manager、
+  borrower 参数同步组件和 borrower LB 管理；GroupScheduler 只维护 node/GPU lease 与 fencing。
 
 ### 3.3 三种资源视图
 
@@ -91,9 +96,12 @@ Ray 原生资源冲突规避方案。
 ### 3.4 参数同步
 
 - 参数同步时机保持 verl 原生行为，GroupScheduler 不决定同步时间点。
-- GroupScheduler 只调整 Checkpoint Engine 感知的有效 replica 集合。
+- GroupScheduler 不持有 replica/worker/adapter runtime handles，也不直接调整 Checkpoint Engine；它通过 borrower
+  `TaskRunner` 下发规模命令，由 borrower 任务更新 Checkpoint Engine 感知的有效 replica 集合。
 - 新 borrower replica 完成明确版本同步后才能加入 LB。
 - 原生 CE 只能覆盖它实际持有 replica/worker handles 的对象，不能从 LB server 列表自动推导覆盖范围。
+- borrowed replica 的同步 endpoint 必须由 borrower 创建并拥有，不能重绑定或临时复用 donor
+  `CheckpointEngineWorker`/`ServerAdapter`。
 - 不能假设使用 donor PG 创建 `BorrowedCheckpointEngineWorker`；该动态 Actor 创建问题仍待 v0.9.0 代码级设计。
 
 ## 4. 已完成的研究和文档
@@ -135,6 +143,8 @@ Ray 原生资源冲突规避方案。
 | `12-python-class-instance-call-and-rayclasswithinitargs.md` | Python 调用语义和 CIA | 新增，待评审 |
 | `14-verl-v0.8-v0.9-hybrid-standalone-differences.md` | v0.8.0→v0.9.0 两种主部署模式的架构、组件和流程差异 | 新增，待评审 |
 | `15-verl-v0.9-hybrid-colocate-async-partial-rollout-interrupt-resume.md` | HYBRID + `colocate_async` 的中断、sleep、权重同步、续推和状态归属全链 | 新增，待评审 |
+| `16-verl-v0.9-dynamic-replica-view-and-reference-audit.md` | HYBRID/STANDALONE 动态 replica 的引用、视图、发布事务和 GAP | 新增，待评审 |
+| `17-verl-v0.9-dynamic-replica-scaling-timing-and-mutual-exclusion.md` | STANDALONE Fully Async、HYBRID partial、HYBRID 同步三种主链的扩缩容时机、CE snapshot、LB drain 和 phase gate | 已按场景全量重构，待评审 |
 
 正式 RFC：`multi_task_scheduler/【WIP】多RL任务资源共享调度RFC.md`。当前 RFC 仍在用户编辑中，更新前先检查工作区差异。
 
@@ -259,17 +269,88 @@ ray_cls_with_init(...)
 
 详细证据和流程见 `14-verl-v0.8-v0.9-hybrid-standalone-differences.md`。
 
+### 5.7 HYBRID / STANDALONE 动态 replica 视图与引用
+
+已完成独立评审文档 `16-verl-v0.9-dynamic-replica-view-and-reference-audit.md`，确认：
+
+- 直接持有 `RolloutReplica` 对象的核心原生字段是 `LLMServerManager.rollout_replicas` 和
+  `CheckpointEngineManager.replicas`；LB、ServerAdapter、ResourcePool 和 WorkerGroup 持有的是派生引用；
+- V1 同进程路径中 manager/CE 初始共享同一个 list，但 CE add 原地 extend、remove 重新绑定 list，这种 alias 会在
+  remove 后失效，不能作为动态一致性协议；
+- Fully Async 的 canonical manager 位于 Rollouter Actor，CE 位于 Trainer Actor并持有 replica 序列化副本；
+  原生 remove 依赖对象 identity，必须改用 stable replica ID；
+- STANDALONE 非 naive 同步会遍历 `CE.replicas[*].workers`，所以有效 replica snapshot 能改变同步接收端；
+- HYBRID naive 同步直接调用 `actor_wg.update_weights()`，真实目标由训练 workers 内的 `ServerAdapter` 静态映射决定，
+  只修改 `CE.replicas` 不能同步一个真正新建的 borrowed replica；
+- base `LLMServerManager` 没有通用运行期 materialize/teardown API；experimental add/remove 只激活初始化时已经创建的
+  HYBRID replicas，不等于跨任务动态创建；
+- vLLM 的 STANDALONE `sleep()`/`wake_up()` 当前跳过执行，KV cache release/resume 也没有实际动作，不能据此形成
+  可捐赠 HBM 空泡；
+- 动态添加在 borrower 内部必须接入三处：manager canonical ownership/lifecycle registry、Checkpoint Engine/sync
+  projection、LB routing projection；任务外还必须维护 GroupScheduler node/GPU lease。容量/监控是派生更新。
+- borrowed overlay 下 Ray 原生 pool/PG 保持 donor 的原预约是预期差异，但 donor 不管理 borrowed replica，也不把
+  任何 runtime handle 交给 borrower；排他性由 lease、fencing、发布顺序和回滚协议约束。
+- 当前 WIP RFC `:129-130,142-143,171-184` 的 donor CheckpointEngineWorker endpoint 重绑定/临时使用方案与最新约束
+  冲突，本轮只在独立评审文档中标记，尚未修改 RFC。
+
+本轮只输出独立评审材料，没有修改正式 WIP RFC。
+
+### 5.8 动态 replica 扩缩容时机与互斥
+
+已按用户确认的三种运行模式全量重构独立评审文档
+`17-verl-v0.9-dynamic-replica-scaling-timing-and-mutual-exclusion.md`：
+
+- STANDALONE 主链改为 experimental `FullyAsyncTaskRunner -> FullyAsyncTrainer / FullyAsyncRollouter`，不再用
+  `PPOTrainerSeparateAsync` 代替 Fully Async；该模式必须同时使用训练 step、参数版本周期和并行 rollout 三条时间轴；
+- HYBRID + partial 以 `PPOTrainerColocateAsync` 的 dispatch、`ReplayBufferAsync.sample()`、abort/sleep、training、step-end
+  sync/resume 为完整 step；
+- HYBRID + 同步以 `PPOTrainerSync` 的自然 drain/sleep、training、step-end sync 为完整 step；
+- 三种模式均分别给出了 CREATE、CE ADD、LB ADD、LB REMOVE、CE REMOVE、DESTROY 的阶段矩阵、版本例子和失败/延期条件；
+- Fully Async 的 canonical manager 位于 `FullyAsyncRollouter` Actor，CE 位于 `FullyAsyncTrainer` Actor 并持有 replica
+  序列化副本，动态伸缩必须做跨 Actor 两阶段提交并同步更新 `max_concurrent_samples`；
+- Fully Async 强制回收只有在 `async_training.partial_rollout=True` 时才能复用 prefix retry；关闭时按自然 drain 处理；
+- HYBRID partial 可在 LB 摘流后复用 target abort 和 client coroutine 中的 prefix 续推；partial prefix 不在 TransferQueue；
+- HYBRID 同步没有 transparent partial retry，deadline 小于剩余请求时间时必须 defer/reject，不能强杀后声称样本可续推；
+- HYBRID naive CE 只调用固定 `actor_wg.update_weights()`，简单向 `self.replicas` 增加 true-new borrower replica 不会同步
+  外部 endpoint；这是两种 HYBRID 场景共同的关键 GAP；
+- “scaling 与参数同步互斥”只应覆盖 sync snapshot cut、版本发布和被 pin 实体销毁；lease reserve、hidden
+  materialize、LB begin-drain 可以按条件并行，不能把整个事务放进一把长持有全局锁；
+- `CheckpointEngineManager.update_weights()` 当前从 abort、worker flatten、KV lifecycle 到 resume 多次读取可变
+  `self.replicas`，开放 TaskRunner 并发控制后会产生成员漂移；一次 sync 必须冻结 immutable tuple，并用 sync/lifecycle
+  refcount 保护销毁；
+- 当前 `GlobalRequestLoadBalancer.remove_servers()` 会立即删除 inflight counter，后到的 fire-and-forget release 被忽略；
+  安全回收需要 `begin_drain/finish_remove` 两阶段协议，同时验证 LB inflight 和 backend queued/running；
+- `TaskRunnerV1` 和 `FullyAsyncTaskRunner` 都以同步长方法占用各自 Ray Actor；运行期间新增普通 actor method 不可达；
+  子仓 TaskRunner 需要 control concurrency group，控制 RPC 只验 fence/入队。HYBRID 由 Trainer phase hook 串行 reconcile，
+  Fully Async 则通过既有 Trainer/Rollouter ActorHandle 做跨 Actor 两阶段提交，不能并发修改 Trainer/CE/manager 裸 list；
+- HYBRID 可借窗口位于 rollout tail，所有 borrowed runtime 必须在 donor `on_sample_end()` 返回、进入 actor training 前
+  完成回收和 HBM 释放；`PPOTrainerSync` 只能自然 drain，`PPOTrainerColocateAsync` 可以复用 partial retry 强制中断；
+- STANDALONE lease 可以跨 donor training 阶段，但 dormant native replica 必须从所有与 lease window 重叠的 donor CE
+  snapshots 排除；回收后需等待 donor 自己的下一次原生 sync 才能重新进 donor LB；
+- 在“GroupScheduler 不改变 verl 原生参数同步时机”前提下，真正运行期新建的 replica 不能帮助已经选入当前 training batch 的
+  样本；它必须等 borrower 下一次原生 sync。partial 场景中，发布后可承接上一版本被中断的 continuation；若要求在原生 sync
+  之前即时接流，仍需另行选择预同步 dormant replica 或版本化即时装载方案；
+- validation 默认冻结 scaling membership；checkpoint save 不直接遍历 rollout replica，不需要与所有 prepare/drain 操作
+  粗粒度互斥，但仍受 HYBRID phase gate 和 task session fencing 约束；
+- 文档中的 8 个 Mermaid 图已使用本地 Mermaid CLI 11.16.0 全量实际渲染成功。
+
+本轮仍未修改正式 WIP RFC，以上结论等待用户评审。
+
 ## 6. 当前未决问题
 
 ### 6.1 动态 borrower rollout 的 Actor 创建
 
 需要基于 v0.9.0 继续明确：
 
-- 不复用 donor ResourcePool/PG/bundle 时，如何创建 borrower 的 `CheckpointEngineWorker` Ray Actor；
-- 是否复用 `RayClassWithInitArgs(sharing_with=...)` 分支；
+- 不复用 donor ResourcePool/PG/bundle/worker/adapter 时，STANDALONE 如何创建 borrower-owned sync receiver；
+- receiver 是否仍应是 `CheckpointEngineWorker` Ray Actor，若是，如何在不申请第二份 Ray GPU 的情况下创建；
 - 是否需要直接使用 NodeAffinity、显式 CUDA visible devices 和定制 Ray options；
 - 新 Actor 如何与 donor sleep 的 vLLM 进程共享同一物理 GPU而不被 Ray 原生资源调度冲突；
-- 谁持有新 ActorHandle，如何组装 `RolloutReplica.workers`。
+- borrower manager 如何持有新 endpoint handle，并如何组装 `RolloutReplica.workers`/effective snapshot。
+
+新增约束：HYBRID 不能把 donor worker handles 追加到 borrower CE list，因为 naive 同步目标由 borrower `actor_wg`
+内既有 `ServerAdapter` 决定；STANDALONE 也只有在 `.workers` 指向 borrower-owned CE/adapter endpoints 时才能进入原生
+同步拓扑。两种模式都禁止 donor endpoint rebind。
 
 ### 6.2 动态 vLLM replica 和 HTTP server
 
@@ -280,11 +361,14 @@ ray_cls_with_init(...)
 → donor server 移出 LB
 → abort/drain
 → donor sleep
-→ 创建 borrower CheckpointEngineWorker/ServerAdapter
-→ 创建 vLLMHttpServer
+→ GroupScheduler reserve node/GPU lease
+→ borrower manager 创建并登记自己的 vLLMHttpServer/backend
+→ 创建或绑定 borrower-owned sync endpoint
 → 启动 vLLM WorkerProc
 → 同步明确版本权重
-→ 更新 CE/manager/LB 有效集合
+→ 更新 borrower CE effective snapshot
+→ 最后发布 borrower head server 到 borrower LB
+→ GroupScheduler commit lease ACTIVE
 ```
 
 还需要定义任何一步失败后的回滚顺序。
@@ -309,14 +393,25 @@ ray_cls_with_init(...)
 
 ### 6.4 参数同步有效集合
 
-需要明确：
+文档 `17` 已明确时间和互斥原则：
 
-- 动态 add/remove replica 与 `CheckpointEngineManager.update_weights()` 是否并发；
-- `replicas` 列表和临时 rollout `RayWorkerGroup` 的一致性；
-- 正在同步时能否回收；
-- 新增实例首次同步失败时是否允许进入 LB；
-- donor 唤醒时如何恢复其原任务版本；
-- 跨任务模型、tokenizer 或并行配置不兼容时如何拒绝共享。
+- desired membership 可在 sync 期间记录，但当前 epoch 使用 immutable snapshot；
+- 已被 snapshot pin 的 replica 可以先进入 DRAINING，不能销毁；
+- 新增实例首次同步失败时保持 hidden，不能进入 LB；
+- donor native replica 回收后必须在 donor 原生 sync 获得当前版本后才能重新进 LB；
+- GroupScheduler 不直接触发权重同步。
+
+仍需明确：
+
+- immutable snapshot/pin 的具体 API 和异常恢复；
+- 跨任务模型、tokenizer、backend 和并行配置不兼容时如何在 lease 前拒绝共享；
+- sync receipt 的数据结构、版本校验和 LB publish 超时补偿。
+
+还需分别解决：
+
+- HYBRID 真正新建 replica 的动态 ServerAdapter/权重 endpoint；
+- STANDALONE borrowed replica 的 borrower-owned receiver endpoint 创建；
+- 一次 sync 从 worker 展平到 finalize 全程使用同一个不可变 replica snapshot。
 
 ### 6.5 三种视图的一致性协议
 
@@ -349,13 +444,13 @@ ACTIVE_DONOR
 
 推荐按以下顺序继续：
 
-1. 分析 STANDALONE 动态 borrower `CheckpointEngineWorker` 的无 PG 创建路径。
-2. 追踪 `vLLMReplica.launch_servers()` 如何利用 worker node ID/GPU ID 创建 `vLLMHttpServer`，判断哪些代码可复用。
-3. 形成 donor/borrower 创建、同步、加入 LB、回收的 v0.9.0 完整 AS-IS/TO-BE 对照时序。
-4. 基于文档 `15` 已确认的原生边界，设计 per-replica 摘流、请求唯一所有权和跨 replica continuation 协议。
-5. 定义三种视图的状态机、锁和失败回滚规则。
-6. 经用户评审后更新 `07`、`08` 和正式 RFC。
-7. 完成文档评审后更新正式 RFC；需要远端同步时再推送当前提交。
+1. 联合评审文档 `16` 的 M/C/L/G 视图边界与文档 `17` 的 phase/snapshot gate，先确认原子性和时间语义。
+2. 确认“真正新建 replica 等下一原生 sync 生效”是否满足实时扩容目标；若不满足，单独评审预同步/即时版本装载方案。
+3. 设计 CE immutable snapshot/pin 与 LB `begin_drain/finish_remove` 的最小 API，并先做并发测试。
+4. 选择 HYBRID borrowed replica 的动态权重 endpoint 方案，不能继续把 `CE.add_replicas()` 当作完整答案。
+5. 设计并验证 STANDALONE 的真实 HBM release，以及 borrower CE/ServerAdapter endpoint 创建方案。
+6. 基于文档 `15` 的原生边界，设计 per-replica 摘流、请求唯一所有权和跨 replica continuation 协议。
+7. 经用户评审后再更新 `07`、`08` 和正式 RFC；当前不改 WIP RFC。
 
 ## 8. 进度维护规则
 
