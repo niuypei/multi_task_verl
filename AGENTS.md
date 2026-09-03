@@ -69,12 +69,20 @@
 - 必须区分新 replica 的 `BOOTSTRAPPING` 与 verl 原生参数同步：bootstrap 是事件驱动的 target-only 追平操作，只把新
   replica 同步到 borrower 当前已发布的 serving version；原生参数同步才发布 next version 并更新全部 effective replica。
 - `GroupScheduler` 不改变 verl 原生参数同步的 hook 和触发条件。若 bootstrap 已经开始，原生同步请求可以按原时机到达并进入
-  pending，但 snapshot cut、process-group 构建和传权必须等待 bootstrap 完成 CE effective membership 与 LB `ROUTABLE`
-  提交或失败回滚。
+  pending。STANDALONE 的 `update_weights()` 入口、process-group 构建和传权必须等待 replica-sync gate；HYBRID 的 snapshot cut、
+  process-group 构建和传权必须等待 weight-version gate。两种模式都必须等 bootstrap 完成 CE effective membership 与 LB
+  `ROUTABLE` 提交或失败回滚。
 - bootstrap 不递增任务参数版本、不 reset 全局 staleness、不 abort 已有 replica，也不让已有 replica 重复参与传输。
 - bootstrap 必须读取不可变的当前已发布权重版本；不得把可能已经领先的 trainer live weights 标成当前 serving version。
-- 新 replica 成为 `ROUTABLE` 前必须已经进入 CE effective membership；释放 bootstrap/native gate 后，下一次原生同步 snapshot
-  必须包含该 replica，并与其他 effective replica 一起更新。
+- 新 replica 成为 `ROUTABLE` 前必须进入 CE effective membership。STANDALONE + Fully Async 第一版只维护一个
+  `effective_replicas` 集合，并由同一把 task-local `replica-sync gate` 端到端串行 bootstrap、CE ADD/REMOVE、LB
+  `ROUTABLE` 提交或回滚以及 verl 原生参数同步。该模式不额外维护 membership gate、desired membership 或
+  `native_sync_snapshot`；原生同步持锁期间，`effective_replicas` 本身就是稳定的接收端集合。
+- STANDALONE + Fully Async 的隐藏 runtime 创建和 LB `begin_drain()` 可以在 `replica-sync gate` 外执行。ADD 只有在 bootstrap
+  成功后才能把 replica 加入 `effective_replicas`；REMOVE 必须先获得同一把 gate，再从 `effective_replicas` 删除目标 replica。
+  所有代码路径都不得绕过该 gate 直接调用 CE 的 `add_replicas()` 或 `remove_replicas()`。
+- HYBRID partial 当前仍保留 membership/weight-version gate、lifecycle snapshot 和 H4 immutable sync snapshot 的独立设计；不得把
+  STANDALONE 的单集合特化自动推广到 HYBRID。
 - `GroupScheduler` 不持有 replica/worker/adapter runtime handles，也不直接调用参数同步组件；它通过目标任务的
   `TaskRunner` 下发规模命令，由 borrower 任务更新参数同步组件当前感知的有效 replica 集合。
 - 有效集合应表达本任务固有 replica、当前受赠 replica、已捐出 replica 和正在回收 replica 的状态变化。
@@ -84,13 +92,22 @@
 - 不得虚构 verl 已有 `BorrowedCheckpointEngineWorker` 类。TO-BE 新类必须明确标注为 Proposed，并说明创建方式。
 - borrowed replica 的同步 receiver/`ServerAdapter` endpoint 必须由 borrower 创建并拥有；不得通过重绑定或临时使用
   donor `CheckpointEngineWorker`/`ServerAdapter` 解决。
-- bootstrap 超时、receiver 失败或 LB ADD 失败时，必须保持新 replica 不可路由，回滚 CE effective membership 并释放 gate；
-  动态扩容失败不得永久阻塞 verl 原生参数同步。
+- bootstrap 超时、receiver 失败或 LB ADD 失败时，必须保持新 replica 不可路由，回滚 CE effective membership 并释放当前模式的
+  bootstrap/native gate；动态扩容失败不得永久阻塞 verl 原生参数同步。
 - 当前阶段优先分析 Checkpoint Engine 固有能力；除非用户重新要求，否则不要默认依赖 Mooncake/DDR offload 解决同步。
 
 ### 3.4 partial rollout 与回收
 
 - partial rollout 是生成阶段的中断和续推机制，不等于使用半条 trajectory 进行 PPO 更新。
+- 对 `RolloutMode.HYBRID + trainer.v1.trainer_mode=colocate_async`，borrower temporary replica 可以跨过
+  `on_sample_end()`、training、step-end 参数同步并保留到下一 step；`on_sample_end()` 只对当时冻结的 lifecycle snapshot 执行
+  abort/sleep，不隐含 CE/LB REMOVE、runtime DESTROY 或 GS lease 归还。
+- HYBRID partial 的参数同步前必须在 task-local membership/weight-version gate 下冻结 immutable effective snapshot；该 snapshot
+  包含 native replica 与仍有效的 borrowed replica。同步期间 ADD/REMOVE 只能更新 desired state，不能改变已 pin snapshot，也不能
+  销毁其中的 borrowed replica。
+- borrower 的 `on_sample_end()` 不是 donor lease 的到期点。只有 GroupScheduler 的独立 recall、lease deadline 或物理 GPU
+  安全条件要求归还时，才执行 borrowed replica 的摘流和销毁；若保留 sleeping runtime 与 donor training 共存，必须额外证明无活跃
+  CUDA 工作且实际释放的 HBM 满足 donor 训练需求。
 - 训练样本是否完整必须依据 ReplayBuffer、TransferQueue 和 AgentLoop 的真实状态流判断。
 - 强制回收时，应优先审视能否复用 verl 原生 abort/resume、token 前缀保存、剩余 token budget 和版本记录机制。
 - 必须明确 partial 状态保存在服务端、TransferQueue、客户端协程还是其他组件；不能笼统写“请求被保存”。
@@ -168,8 +185,15 @@
 → Actor 内委托对象
 ```
 
-## 5. 实体和图示标准
+## 5. 写作、实体和图示标准
 
+- 每个技术句子必须具有明确的主语和宾语，并说明主语对宾语执行了什么动作；不得使用“完成同步”“更新集合”“进行回收”等无法
+  判断执行者或作用对象的省略表达。
+- 描述优先使用简洁的主动句。一个句子只承载一个主要状态变化或因果关系；调用链较长时拆成编号步骤，不用多层从句串联多个动作。
+- 自定义名词、项目内特有名词和业界不常用的名词在首次出现时必须给出定义。定义至少说明该名词指代的对象、用途和适用范围；缩写在
+  首次出现时同时给出全称。后续图、表、正文和伪码必须使用同一名称，不随意更换同义词。
+- 代词必须有唯一、就近的指代对象。存在多个 replica、snapshot、manager 或 task 时，直接写出实体名称，避免使用含糊的“它”、
+  “当前对象”“对应组件”。
 - AS-IS 图中的实体名称必须使用代码中真实存在的类名、函数名或明确的运行时对象名称。
 - 禁止使用不存在的 `TrainingActor`、任意 `X_` 前缀或无代码依据的占位类。
 - TO-BE 实体必须明确标注 Proposed，避免与 AS-IS 混淆。
@@ -241,6 +265,7 @@
 - [ ] 已从入口追到最终执行实体，没有停在中间包装层。
 - [ ] 已区分 AS-IS、TO-BE 和 GAP。
 - [ ] 已审视用户方案的正确性和限制，而不是直接接受。
+- [ ] 技术句子具有明确主语、宾语和动作；自定义或非常用名词在首次出现时已有定义。
 - [ ] 图中实体名真实、类型明确、Mermaid 可渲染并有文字解释。
 - [ ] 未修改用户未授权的文件。
 - [ ] 如有实质进展，已更新进展文档。
