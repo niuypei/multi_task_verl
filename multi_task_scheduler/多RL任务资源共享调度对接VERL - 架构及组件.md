@@ -901,23 +901,23 @@ sequenceDiagram
 
 # 5. 需求拆解
 
-## SR：TaskRunner支持向GlobalScheduler注册、注销任务，上报资源及实例信息
+## SR：TaskRunner支持通过node id、gpu id基于任务现有资源创建推理实例 （下周启动）
+
+## SR：TaskRunner支持将指定推理实例（包括自有实例和租借实例）销毁、休眠、唤醒（下周启动）
+
+## SR：TaskRunner支持向GlobalScheduler注册、注销任务，上报资源及实例信息（下周启动）
 - AR1：TaskRunner通过心跳上报任务、节点、GPU 和 资源租借状态
 - AR2：GlobalScheduler接收 GlobalLoadbalancer 上报的 per-replica inflight/idle/routing 状态
 
 ## SR：GlobalLoadbalancer支持感知空泡推理实例及获取其资源信息
 - AR1：支持识别4种异步模式下推理实例进入空泡阶段
 
-## SR：TaskRunner支持通过node id、gpu id基于任务现有资源创建推理实例
-
-## SR：TaskRunner支持将指定推理实例（包括自有实例和租借实例）销毁、休眠、唤醒
-
-## SR：GlobalScheduler调度决策迁移适配VERL
-- AR1：结合任务需求、空泡预测、优先级和初始化开销生成 DONATE/ASSIGN/PREEMPT/RECLAIM 等决策
-- AR2：将决策发送给 donor/borrower TaskRunner
-- AR3：支持全局资源视图维护
-
 ## SR：TaskRunner支持动态添加、移除推理实例
 - CheckpointEngineManager 新增权重同步锁，支持参数同步和添加/移除租借推理是互斥
 
 ## SR：CheckpointEngine支持将权重同步给租借推理实例
+
+## SR：GlobalScheduler调度决策迁移适配VERL 
+- AR1：结合任务需求、空泡预测、优先级和初始化开销生成 DONATE/ASSIGN/PREEMPT/RECLAIM 等决策
+- AR2：将决策发送给 donor/borrower TaskRunner
+- AR3：支持全局资源视图维护
