@@ -794,3 +794,130 @@ classDiagram
 #### 4.2.2.2 TO-BE
 
 ![示例图片](./img/standalone_to_be.png)
+
+
+## 4.3 关键流程
+
+### 4.3.1 Fully Async ADD：跨 Trainer / Rollouter Actor 的提交协议
+
+`PreparedReplica`：初始化完成的replica，但是尚未加入 Borrowed 任务。
+`BootstrapReceipt`：记录 replica ID、目标权重版本、operation ID、lease step 和全部接收端的完成状态。
+
+```mermaid
+sequenceDiagram
+    participant GS as GroupScheduler<br/> Ray Actor
+    participant TR as MultiTaskFullyAsyncTaskRunner<br/> Ray Actor
+    participant FAR as FullyAsyncRollouter<br/>Ray Actor
+    participant M as MultiTaskLLMServerManager<br/> 普通对象
+    participant R as vLLMReplica<br/>borrower 普通对象
+    participant H as vLLMHttpServer<br/>borrower Ray Actor
+    participant FAT as FullyAsyncTrainer<br/>Ray Actor
+    participant C as MultiTaskCheckpointEngineManager<br/> 普通对象
+    participant L as MultiTaskGlobalRequestLoadBalancer<br/> Ray Actor
+
+    GS->>TR: ADD(operation_id, replica_id, lease_epoch, node_id, gpu_ids)
+    TR->>FAR: prepare_replica.remote(...)
+    FAR->>M: materialize_hidden(node_id, gpu_ids)
+    M->>R: 构造 borrower-owned vLLMReplica
+    R->>H: 在指定 node/GPU 上创建 server Actor
+    H-->>M: 返回 health 和 server handle
+    M-->>FAR: 返回 PreparedReplica (LB 尚不可见)
+    FAR-->>TR: 返回 prepared replica actor names
+    TR->>FAT: bootstrap_and_publish.remote(actor_names)
+    FAT->>FAT: acquire_replica_sync_gate(operation_id)
+    FAT->>C: add_effective_replica(actor_names)，仍持有同一 gate
+    FAT->>FAR: publish_if_receipt_matches.remote(receipt)
+    FAR->>L: commit_routable(replica_id, head_server)
+    L-->>FAR: 返回 routing_epoch
+    FAR->>FAR: 更新 max_concurrent_samples
+    FAR-->>FAT: 返回 ready replica信息(routing_epoch)
+    FAT->>FAT: release_replica_sync_gate(operation_id)
+    FAT-->>TR: 返回 ACTIVE(replica_id, replica_snapshot, routing_epoch)
+    TR-->>GS: 返回 ACTIVE(replica_id, lease_epoch)
+    Note over FAT,C: 原参数同步触发条件
+    FAT->>FAT: acquire_replica_sync_gate(native_sync)
+    FAT->>C: update_weights()
+    Note over FAT,C: 整个 update_weights() 期间 effective_replicas 不变
+    C-->>FAT: 返回 NativeSyncReceipt
+    FAT->>FAT: release_replica_sync_gate(native_sync)
+```
+
+图中的流程按以下顺序提交新 replica：
+
+1. `GroupScheduler` 把 node ID/GPU IDs 租约和 operation ID 发送给`MultiTaskFullyAsyncTaskRunner`。
+2. `MultiTaskFullyAsyncTaskRunner` 调用 `FullyAsyncRollouter`。`FullyAsyncRollouter` 再调用其进程内的
+   `MultiTaskLLMServerManager`，让 manager 创建 borrower-owned `vLLMReplica` 和 `vLLMHttpServer`。不把 server 加入 LB。`PreparedReplica` 只携带可序列化的 replica ID、server ActorHandle 和 actor names。
+3. `FullyAsyncTrainer` 获得 replica-sync gate。原生参数同步已经持有 gate 时，`FullyAsyncTrainer` 等待原生参数同步完成。
+4. 全部接收端返回同一版本后，`MultiTaskCheckpointEngineManager` 生成 `BootstrapReceipt`。`FullyAsyncTrainer` 在仍持有同一把
+   replica-sync gate 时把新 replica 加入 `effective_replicas`。
+5. `FullyAsyncTrainer` 把回执发送给 `FullyAsyncRollouter`。`FullyAsyncRollouter` 校验 operation ID、lease epoch，然后让 LB 把 head server 提交为 `ROUTABLE`。
+6. LB 返回 `routing_epoch` 后，`FullyAsyncRollouter` 增加 `max_concurrent_samples`。
+7. `FullyAsyncTrainer` 收到 `ready replica` 回执后释放 replica-sync gate。下一次 verl 原生参数同步获得该 gate 后，直接遍历已经包含 borrowed replica 的 `effective_replicas`。
+8. `MultiTaskFullyAsyncTaskRunner` 只在上述步骤全部成功后向 `GroupScheduler` 返回 `ACTIVE`。
+
+### 4.3.2 HYBRID partial ADD：同 Actor 控制对象的提交协议
+
+HYBRID partial 与 Fully Async 使用相同的推理实例添加/移除与参数同步串行的语义。HYBRID 的 Trainer、manager 和 CE 位于同一个`TaskRunnerV1` Actor 进程，因此 `MultiTaskTaskRunnerV1` 只需要把命令委托给`MultiTaskPPOTrainerColocateAsync`，不需要把 manager 保存为 TaskRunner 的新增成员变量。
+
+```mermaid
+sequenceDiagram
+    participant GS as GroupScheduler<br/> Ray Actor
+    participant TR as MultiTaskTaskRunnerV1<br/> Ray Actor
+    participant PT as MultiTaskPPOTrainerColocateAsync<br/> Actor 内普通对象
+    participant M as MultiTaskLLMServerManager<br/> Actor 内普通对象
+    participant C as MultiTaskCheckpointEngineManager<br/> Actor 内普通对象
+    participant R as vLLMReplica<br/>borrower 普通对象
+    participant H as vLLMHttpServer<br/>borrower Ray Actor
+    participant L as MultiTaskGlobalRequestLoadBalancer<br/> Ray Actor
+
+    GS->>TR: ADD(operation_id, replica_id, lease_epoch, node_id, gpu_ids)
+    TR->>PT: scale_add(command)
+    PT->>M: materialize_hidden(node_id, gpu_ids)
+    M->>R: 创建 borrower-owned vLLMReplica
+    R->>H: 在指定 node/GPU 上创建 server Actor
+    H-->>M: 返回 actor names
+    M-->>PT: 返回 PreparedReplica (LB 尚不可见)
+    PT->>C: acquire_replica_sync_gate(operation_id)
+    C->>C: weight_update(actor_names, target_version)
+    C-->>PT: 返回全部 borrower 的 BootstrapReceipt(replica_id, target_version)
+    PT->>C: commit_effective(replica_id)，持有 membership gate
+    M->>L: commit_routable(replica_id, head_server, receipt)
+    L-->>M: 返回 ROUTABLE(routing_epoch)
+    M-->>PT: 返回 ROUTABLE(routing_epoch)
+    PT->>C: release_replica_sync_gate(operation_id)
+    PT-->>TR: 返回 ACTIVE(replica_id, target_version)
+    TR-->>GS: 返回 ACTIVE(replica_id, lease_epoch)
+
+    Note over PT,C: 后续 on_sample_end 等待所有 admission token 释放
+    PT->>C: freeze_lifecycle_snapshot()，然后 abort/sleep
+    PT->>C: acquire_replica_sync_gate(sync_epoch)
+    C->>C: freeze S(g)=native + effective borrowed
+    C->>C: native subset 使用固定 actor_wg naive path 同步权重
+    C->>C: borrowed subset 使用 external receiver path 同步全中
+    C-->>PT: 返回 NativeSyncReceipt(Vnext, S(g))
+    PT->>C: release_replica_sync_gate(sync_epoch)
+```
+
+
+# 5. 需求拆解
+
+## SR：TaskRunner支持向GlobalScheduler注册、注销任务，上报资源及实例信息
+- AR1：TaskRunner通过心跳上报任务、节点、GPU 和 资源租借状态
+- AR2：GlobalScheduler接收 GlobalLoadbalancer 上报的 per-replica inflight/idle/routing 状态
+
+## SR：GlobalLoadbalancer支持感知空泡推理实例及获取其资源信息
+- AR1：支持识别4种异步模式下推理实例进入空泡阶段
+
+## SR：TaskRunner支持通过node id、gpu id基于任务现有资源创建推理实例
+
+## SR：TaskRunner支持将指定推理实例（包括自有实例和租借实例）销毁、休眠、唤醒
+
+## SR：GlobalScheduler调度决策迁移适配VERL
+- AR1：结合任务需求、空泡预测、优先级和初始化开销生成 DONATE/ASSIGN/PREEMPT/RECLAIM 等决策
+- AR2：将决策发送给 donor/borrower TaskRunner
+- AR3：支持全局资源视图维护
+
+## SR：TaskRunner支持动态添加、移除推理实例
+- CheckpointEngineManager 新增权重同步锁，支持参数同步和添加/移除租借推理是互斥
+
+## SR：CheckpointEngine支持将权重同步给租借推理实例
